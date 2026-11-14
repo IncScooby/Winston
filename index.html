@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>5-Min BTC Desk</title>
-<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 :root{
   --bg:#0a0e17;--panel:#111826;--panel2:#161f31;--line:#222d45;--txt:#e9eef9;--mut:#8592ad;
@@ -569,6 +568,7 @@ async function tick() {
 initChart();
 if (!TOKEN) openSettings();
 tick(); setInterval(tick, 1000);
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </script>
 </body>
 </html>
