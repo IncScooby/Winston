@@ -54,7 +54,7 @@ h3{margin:0 0 10px;font:600 15px Fredoka,sans-serif;color:var(--mu)}
 .brain{background:#0e0a1f88;border:1px solid var(--ln);border-radius:16px;padding:12px;font-size:14px;line-height:1.45}
 .brain h4{margin:0 0 6px;font:600 14px Fredoka}.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .feed{max-height:170px;overflow:auto;margin-top:10px}.feed div{padding:6px 0;border-bottom:1px solid var(--ln);font-size:13px}.feed small{color:var(--mu);margin-right:6px}
-.t-go,.t-win{color:var(--up)}.t-loss{color:var(--dn)}.t-info{color:#b9a6ff}
+.t-go,.t-win{color:var(--up)}.t-loss{color:var(--dn)}.t-info{color:#b9a6ff}.t-terry{color:var(--su)}.t-sys{color:var(--mu)}
 .seg{display:grid;grid-template-columns:1fr 1fr;background:#0e0a1f88;border:1px solid var(--ln);border-radius:14px;padding:3px}
 .seg button{border:0;background:none;padding:10px;border-radius:11px;font:600 14px Fredoka;color:var(--mu)}.seg .on{background:var(--vi);color:#fff}
 .sl{margin:12px 0 2px}.sl label{display:flex;justify-content:space-between;font-size:12px;color:var(--mu);margin-bottom:4px}.sl b{color:var(--tx)}
@@ -267,13 +267,14 @@ function render(s){
  $("cash").disabled=!p;$("cash").textContent=p?"Cash out · "+(p.unrealized_pnl!=null?usd(p.unrealized_pnl):""):"Cash out";
  /* both brains */
  const sg=s.signal||{},tOn=sg.source==="terrycalls",tc=[];
- $("terryTxt").textContent=tOn?(sg.side?"Calling "+sg.side+(sg.confidence!=null?" at "+Math.round(sg.confidence)+"% confidence":"")+".":sg.lean?"Leaning "+sg.lean+", no call yet.":"No call yet."):"Terry isn't the active source right now.";
+ const lt=(s.chat||[]).slice().reverse().find(m=>m.who==="terry");
+ $("terryTxt").textContent=lt?lt.text:(tOn?(sg.detail||"No call yet."):"No call from Terry yet.");
  if(s.terry.enabled)tc.push(`<span class="pill ${s.terry.status==="ok"?"ok":"w"}">${esc(s.terry.status)}</span>`);
  if(tOn&&sg.status)tc.push(`<span class="pill">${esc(sg.status)}</span>`);
  $("terryChips").innerHTML=tc.join("");
  $("think").textContent=s.thinking;
  $("botChips").innerHTML=`<span class="pill">${tOn?"Using Terry Calls":"Using Momentum"}</span>`+(s.config.paused?'<span class="pill w">Paused</span>':"");
- $("feed").innerHTML=(s.thoughts||[]).slice().reverse().map(t=>`<div class="t-${t.tone}"><small>${clock(t.ts)}</small>${esc(t.text)}</div>`).join("");
+ $("feed").innerHTML=(s.chat||[]).slice().reverse().map(t=>`<div class="t-${t.tone}"><small>${clock(t.ts)}</small>${t.who==="terry"?"🔮 ":t.who==="winston"?"🤖 ":""}${esc(t.text)}</div>`).join("");
  if(!built)buildSl(s.config);else syncSl(s.config);
  $("pause").textContent=s.config.paused?"▶ Resume":"⏸ Pause";$("pause").className="btn"+(s.config.paused?" pri":"");
  document.querySelectorAll("#seg button").forEach(b=>b.className=b.dataset.src===s.config.signal_source?"on":"");
