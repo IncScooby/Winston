@@ -268,7 +268,7 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt
 const lsGet = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
 
-let API = (lsGet("deskApi") || window.location.origin).replace(/\/+$/, "");
+let API = (lsGet("deskApi") || winston-production-8e92ea75.up.railway.app).replace(/\/+$/, "");
 let TOKEN = lsGet("deskToken") || "";
 let S = null, offset = 0, busy = false, slidersBuilt = false, activeSlider = null;
 
