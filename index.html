@@ -77,6 +77,12 @@ pre{margin:0;font-size:11px;color:var(--mu);white-space:pre-wrap;max-height:220p
 .conf{position:fixed;top:-30px;font-size:28px;pointer-events:none;z-index:70;animation:fall 2.4s ease-in forwards}@keyframes fall{to{transform:translateY(110vh) rotate(540deg);opacity:.2}}
 .shake{animation:sh .4s}@keyframes sh{25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+.tg{display:inline-flex;background:#0b0219;border:1px solid var(--ln);border-radius:10px;padding:2px}.tg button{border:0;background:none;padding:4px 10px;border-radius:8px;font:11px Bungee;color:var(--mu)}.tg .on{background:var(--pk);color:#fff}
+.tfs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}@media(max-width:620px){.tfs{grid-template-columns:1fr}}
+.tf{background:#0b0219;border:1px solid var(--ln);border-radius:12px;padding:9px;font-size:12px}.tf h4{margin:0 0 4px;font:12px Bungee;color:var(--su);display:flex;justify-content:space-between}.tf .r{display:flex;justify-content:space-between;gap:6px;padding:2px 0}.tf .r span:first-child{color:var(--mu)}
+.bar{height:8px;border-radius:4px;background:#ff2e9333;overflow:hidden}.bar i{display:block;height:100%;background:var(--up)}
+.game canvas{width:100%;height:110px;display:block}
+.dig.tick:not(.hot){animation:flip .25s}@keyframes flip{from{transform:translateY(-8px);opacity:.3}}
 </style></head><body>
 <div class="tick"><div class="tickin" id="tickin">…</div></div>
 <div class="wrap" id="app">
@@ -92,9 +98,9 @@ pre{margin:0;font-size:11px;color:var(--mu);white-space:pre-wrap;max-height:220p
 
 <div class="m">
 <div class="card chartc">
-<div class="row sp"><h3 style="margin:0">Live chart</h3><button class="btn" id="fit" style="padding:3px 9px">Reset view</button></div>
+<div class="row sp"><h3 style="margin:0">Live chart</h3><div class="row"><div class="tg" id="mode"><button data-m="glide" class="on">Smooth</button><button data-m="candle">Candles</button></div><button class="btn" id="fit" style="padding:3px 9px">Reset view</button></div></div>
 <div class="chips" style="margin-top:8px"><span class="chip t" id="chT">TARGET –</span><span class="chip" id="chB">BTC –</span><span class="chip" id="chG">GAP –</span><span class="chip" id="chW">–</span></div>
-<div id="chart"></div>
+<div id="chart"></div><div class="tfs" id="tfs" style="margin-top:10px"></div>
 </div>
 
 <div class="deck">
@@ -110,7 +116,7 @@ pre{margin:0;font-size:11px;color:var(--mu);white-space:pre-wrap;max-height:220p
 </div>
 
 <div class="card tabsc">
-<div class="tabs" id="tabs"><button data-t="ctl" class="on">⚡ Controls</button><button data-t="str">🔥 Streaks</button><button data-t="brn">🧠 Brains</button><button data-t="trd">💰 Trades</button><button data-t="log">📜 Log</button></div>
+<div class="tabs" id="tabs"><button data-t="ctl" class="on">⚡ Controls</button><button data-t="str">🔥 Streaks</button><button data-t="brn">🧠 Brains</button><button data-t="trd">💰 Trades</button><button data-t="aud">🛡 Audit</button><button data-t="gam">🎮 Call It</button><button data-t="log">📜 Log</button></div>
 <div class="pane on" id="p_ctl">
 <div class="mu" style="font-size:12px">How hungry is Winston? Tap one:</div>
 <div class="pre"><button data-p="chill">😴 Chill</button><button data-p="bal">🌴 Balanced</button><button data-p="hunt">🔥 Hunter</button></div>
@@ -121,6 +127,8 @@ pre{margin:0;font-size:11px;color:var(--mu);white-space:pre-wrap;max-height:220p
 <div class="pane" id="p_str"><div class="tiles" id="tiles"></div><h3>Past leans <span class="mu" style="font-family:Outfit;font-size:11px;letter-spacing:0">(recorded while this page is open)</span></h3><div id="leans"></div></div>
 <div class="pane" id="p_brn"><div class="two"><div class="brain"><h4>🔮 TERRY CALLS</h4><div id="terryTxt">…</div></div><div class="brain"><h4>🤖 WINSTON</h4><div id="think">…</div></div></div><div class="feed" id="feed"></div></div>
 <div class="pane" id="p_trd"><div class="tw"><table><thead><tr><th>Closed</th><th>Mode</th><th>Side</th><th>In → Out</th><th>Why</th><th style="text-align:right">Profit</th></tr></thead><tbody id="ledger"></tbody></table></div><div class="mu" id="noT" style="padding:10px 2px">No trades yet.</div></div>
+<div class="pane" id="p_aud"><div class="row" id="audTop" style="gap:16px;margin-bottom:10px"></div><div id="calib"></div><h3 style="margin-top:10px">Audit log (open and close prices you can check)</h3><div id="audlog"></div></div>
+<div class="pane" id="p_gam"><div class="two"><div class="game" id="gameBox"></div><div><h3>Leaderboard</h3><div id="board"></div></div></div></div>
 <div class="pane" id="p_log"><pre id="log"></pre></div>
 </div>
 </div>
@@ -150,6 +158,9 @@ const usd=x=>(x<0?"-":"+")+"$"+Math.abs(x).toFixed(2),plain=x=>"$"+Number(x).toF
 const pct=p=>p==null?"–":Math.round(p*100)+"%",cls=x=>x>=0?"up":"dn";
 const clock=t=>new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"});
 const dur=s=>{s=Math.round(s);return Math.floor(s/60)+"m "+String(s%60).padStart(2,"0")+"s"};
+function roll(el,to,fmt,ms){ms=ms||450;if(to==null||isNaN(to)){el.textContent=fmt(null);el._v=null;return}
+ if(el._v===to)return;const from=el._v==null?to:el._v;el._v=to;cancelAnimationFrame(el._r);const t0=performance.now();
+ const step=t=>{const k=Math.min(1,(t-t0)/ms),e=1-Math.pow(1-k,3);el.textContent=fmt(from+(to-from)*e);if(k<1)el._r=requestAnimationFrame(step)};el._r=requestAnimationFrame(step)}
 function toast(m,err){const t=$("toast");t.textContent=m;t.className=err?"err":"";t.style.display="block";clearTimeout(toast.h);toast.h=setTimeout(()=>t.style.display="none",4000)}
 async function api(path,body){
  const o={headers:{"X-Admin-Token":TOKEN,"Content-Type":"application/json"},cache:"no-store"};
@@ -165,7 +176,7 @@ function party(win){
   e.style.left=Math.random()*100+"vw";e.style.animationDelay=Math.random()*.6+"s";document.body.appendChild(e);setTimeout(()=>e.remove(),3200)}}
 
 /* chart: curved line, a pad series fixes the x-axis to exactly this 5-minute round */
-let chart=null,series=null,pad=null,lines=[],lineKey="",chartWs=null,lastT=0,markKey="";
+let chart=null,series=null,candle=null,pad=null,lines=[],lineKey="",chartWs=null,lastT=0,markKey="";
 function initChart(){
  const el=$("chart");
  if(!window.LightweightCharts){el.innerHTML='<div class="mu" style="padding:30px">Chart library could not load. Check your connection or ad-blocker.</div>';return}
@@ -178,13 +189,15 @@ function initChart(){
  series=chart.addBaselineSeries({baseValue:{type:"price",price:0},lineType:2,
   topLineColor:"#14ffc8",topFillColor1:"rgba(20,255,200,.35)",topFillColor2:"rgba(20,255,200,.02)",
   bottomLineColor:"#ff2e6e",bottomFillColor1:"rgba(255,46,110,.02)",bottomFillColor2:"rgba(255,46,110,.35)",lineWidth:3,priceLineVisible:false});
+ candle=chart.addCandlestickSeries({upColor:"#14ffc8",downColor:"#ff2e6e",borderVisible:false,wickUpColor:"#14ffc8",wickDownColor:"#ff2e6e",visible:false,priceLineVisible:false});
  new ResizeObserver(()=>chart.applyOptions({width:el.clientWidth,height:340})).observe(el)}
 function setLines(o,t){
- lines.forEach(l=>{try{series.removePriceLine(l)}catch(e){}});
- lines=[series.createPriceLine({price:o,color:"#ffc14d",lineWidth:3,lineStyle:0,axisLabelVisible:true,title:"TARGET"}),
-  series.createPriceLine({price:o*(1+t/100),color:"#14ffc8",lineWidth:1,lineStyle:2,title:"UP trigger"}),
-  series.createPriceLine({price:o*(1-t/100),color:"#ff2e6e",lineWidth:1,lineStyle:2,title:"DOWN trigger"})]}
+ lines.forEach(l=>{try{pad.removePriceLine(l)}catch(e){}});
+ lines=[pad.createPriceLine({price:o,color:"#ffc14d",lineWidth:3,lineStyle:0,axisLabelVisible:true,title:"TARGET"}),
+  pad.createPriceLine({price:o*(1+t/100),color:"#14ffc8",lineWidth:1,lineStyle:2,title:"UP trigger"}),
+  pad.createPriceLine({price:o*(1-t/100),color:"#ff2e6e",lineWidth:1,lineStyle:2,title:"DOWN trigger"})]}
 const resetView=()=>{if(chart&&chartWs)try{chart.timeScale().setVisibleRange({from:chartWs,to:chartWs+299})}catch(e){}};
+const CI=10;function mkCandles(d){const m=new Map();for(const p of d){const t=Math.floor(p.time/CI)*CI,c=m.get(t);if(!c)m.set(t,{time:t,open:p.value,high:p.value,low:p.value,close:p.value});else{c.high=Math.max(c.high,p.value);c.low=Math.min(c.low,p.value);c.close=p.value}}return[...m.values()]}
 function snap(ts,t){let lo=0,hi=ts.length-1,a=null;while(lo<=hi){const m=(lo+hi)>>1;if(ts[m]<=t){a=ts[m];lo=m+1}else hi=m-1}return a}
 function updateChart(s){
  if(!series)return;
@@ -192,14 +205,15 @@ function updateChart(s){
  if(s.window_open){const k=s.window_open+"|"+s.config.min_btc_move;
   if(k!==lineKey){lineKey=k;series.applyOptions({baseValue:{type:"price",price:s.window_open}});setLines(s.window_open,s.config.min_btc_move)}}
  if(ws!==chartWs){chartWs=ws;const o=s.window_open||s.btc_price||0,pd=[];for(let t=ws;t<ws+300;t++)pd.push({time:t,value:o});
-  pad.setData(pd);series.setData(data);lastT=data.length?data[data.length-1].time:0;resetView()}
- else for(const d of data)if(d.time>lastT){series.update(d);lastT=d.time}
+  pad.setData(pd);series.setData(data);candle.setData(mkCandles(data));lastT=data.length?data[data.length-1].time:0;resetView()}
+ else{for(const d of data)if(d.time>lastT){series.update(d);lastT=d.time}if(data.length){const c=mkCandles(data);candle.update(c[c.length-1])}}
  const ts=data.map(d=>d.time),mk=[];
  (s.markers||[]).forEach(m=>{const t=snap(ts,m.time);if(t==null)return;
   if(m.kind==="enter")mk.push({time:t,position:m.side==="UP"?"belowBar":"aboveBar",color:m.side==="UP"?"#14ffc8":"#ff2e6e",shape:m.side==="UP"?"arrowUp":"arrowDown",text:"BUY "+m.side});
   else mk.push({time:t,position:"inBar",color:"#ffc14d",shape:"circle",text:"SELL "+usd(m.pnl||0)})});
- mk.sort((a,b)=>a.time-b.time);const k=JSON.stringify(mk);if(k!==markKey){markKey=k;series.setMarkers(mk)}}
+ mk.sort((a,b)=>a.time-b.time);const k=JSON.stringify(mk);if(k!==markKey){markKey=k;series.setMarkers(mk);candle.setMarkers(mk)}}
 $("fit").onclick=resetView;
+document.querySelectorAll("#mode button").forEach(b=>b.onclick=()=>{const g=b.dataset.m==="glide";document.querySelectorAll("#mode button").forEach(x=>x.classList.toggle("on",x===b));if(series){series.applyOptions({visible:g});candle.applyOptions({visible:!g})}});
 
 /* controls and hunger presets */
 const SL=[["min_btc_move","Min BTC move to enter",0,.3,.005,v=>v.toFixed(3)+"%"],["min_confidence","Min confidence",50,95,1,v=>v.toFixed(0)+"%"],
@@ -220,7 +234,7 @@ function buildSl(c){
 function syncSl(c){SL.forEach(([k,,,,,f])=>{if(activeSl===k)return;const el=$("s_"+k);if(!el)return;el.value=c[k];$("v_"+k).textContent=f(c[k])})}
 $("pause").onclick=async()=>{try{await post("/config",{paused:!S.config.paused});tick()}catch(e){toast(e.message,true)}};
 document.querySelectorAll("#seg button").forEach(b=>b.onclick=async()=>{try{await post("/config",{signal_source:b.dataset.src});tick()}catch(e){toast(e.message,true)}});
-document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{document.querySelectorAll("#tabs button").forEach(x=>x.classList.toggle("on",x===b));document.querySelectorAll(".pane").forEach(p=>p.classList.toggle("on",p.id==="p_"+b.dataset.t))});
+document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{document.querySelectorAll("#tabs button").forEach(x=>x.classList.toggle("on",x===b));document.querySelectorAll(".pane").forEach(p=>p.classList.toggle("on",p.id==="p_"+b.dataset.t));if(b.dataset.t==="gam"&&!G.cur)gameNew();gameBoard()});
 async function manual(side){
  if(S&&S.config.live_trading&&!confirm("LIVE: buy "+side+" with REAL money?"))return;
  try{await post("/manual-trade",{side});toast("Bought "+side);tick()}catch(e){toast(e.message,true)}}
@@ -258,7 +272,7 @@ let LN=[];try{LN=JSON.parse(lsGet("leans")||"[]")}catch(e){}
 let cur={ws:null,lean:null,conf:null,open:null,last:null};
 function trackLean(s){
  if(cur.ws!==s.window_start){
-  if(cur.ws&&cur.lean&&cur.open&&cur.last){const up=cur.last>=cur.open;LN.push({ws:cur.ws,lean:cur.lean,conf:cur.conf,res:up?"UP":"DOWN",ok:(cur.lean==="UP")===up});LN=LN.slice(-300);lsSet("leans",JSON.stringify(LN))}
+  if(cur.ws&&cur.lean&&cur.open&&cur.last){const up=cur.last>=cur.open;LN.push({ws:cur.ws,lean:cur.lean,conf:cur.conf,res:up?"UP":"DOWN",o:cur.open,c:cur.last,ok:(cur.lean==="UP")===up});LN=LN.slice(-300);lsSet("leans",JSON.stringify(LN))}
   cur={ws:s.window_start,lean:null,conf:null,open:s.window_open,last:null}}
  if(s.window_open)cur.open=s.window_open;if(s.btc_price)cur.last=s.btc_price;
  const el=300-s.seconds_left,sg=s.signal||{};if(sg.lean&&el>=30&&el<=250){cur.lean=sg.lean;cur.conf=sg.confidence}}
@@ -272,22 +286,61 @@ function streaks(s){
  $("leans").innerHTML=LN.length?LN.slice(-25).reverse().map(l=>`<div class="lean"><span class="mu">${clock(l.ws)}</span><span>Leaned <span class="side ${l.lean}">${l.lean}</span> ${l.conf!=null?Math.round(l.conf)+"%":""}</span><span>Result <span class="side ${l.res}">${l.res}</span></span><span>${l.ok?"✅":"❌"}</span></div>`).join(""):'<div class="mu" style="padding:8px">No leans yet. One is recorded at the end of each 5-minute round while this page is open.</div>';
  return{ts,tb}}
 
+/* timeframes: 5m comes from the bot; 15m and 1h open prices come straight from Coinbase (swap loadTF for your own feed later) */
+const TF={"15m":{g:900,c:null},"1h":{g:3600,c:null}};
+async function loadTF(){for(const k in TF){try{const r=await fetch("https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity="+TF[k].g);const a=await r.json();TF[k].c=Array.isArray(a)&&a.length?a[0]:null}catch(e){TF[k].c=null}}}
+function renderTF(s){
+ const mv=s.config.min_btc_move,sg=s.signal||{},up=s.prices.up,dn=s.prices.down;
+ const row=(a,b)=>`<div class="r"><span>${a}</span><span>${b}</span></div>`;
+ const trig=pc=>Math.abs(pc)>=mv?`<b class="${pc>=0?"up":"dn"}">HIT · ${pc>=0?"UP":"DOWN"}</b>`:'<span class="mu">waiting</span>';
+ const cards=[["5m",s.window_open,s.btc_price,s.seconds_left,sg.status?esc(sg.status):"–",up!=null?"UP "+pct(up)+" · DOWN "+pct(dn):"–"]];
+ for(const k of ["15m","1h"]){const c=TF[k].c;cards.push([k,c?c[3]:null,s.btc_price,c?c[0]+TF[k].g-Date.now()/1000:null,"no signal feed","not connected"])}
+ $("tfs").innerHTML=cards.map(([k,o,n,l,lock,crowd])=>{const g=o&&n?n-o:null,pc=g==null?null:g/o*100;
+  return `<div class="tf"><h4>${k.toUpperCase()}<span class="${g==null?"":cls(g)}">${g==null?"–":g>=0?"▲ UP":"▼ DOWN"}</span></h4>${row("Target",o?money(o):"–")}${row("Gap",g==null?"–":usd(g))}${row("Time left",l==null?"–":dur(Math.max(0,l)))}${row("Trigger",pc==null?"–":trig(pc))}${row("Lock",lock)}${row("Crowd UP/DOWN",crowd)}</div>`}).join("")}
+function renderAudit(s){
+ const n=LN.length,hit=LN.filter(l=>l.ok).length,p=n?hit/n:0,C=213.6,b=s.scoreboard;
+ $("audTop").innerHTML=`<svg width="90" height="90" viewBox="0 0 90 90"><circle cx="45" cy="45" r="34" fill="none" stroke="#ff2e9344" stroke-width="9"/><circle cx="45" cy="45" r="34" fill="none" stroke="#14ffc8" stroke-width="9" stroke-linecap="round" stroke-dasharray="${C*p} ${C}" transform="rotate(-90 45 45)"/><text x="45" y="51" text-anchor="middle" fill="#fff" font-family="Bungee" font-size="18">${n?Math.round(p*100)+"%":"–"}</text></svg><div><div class="b" style="color:var(--cy);font-size:12px">HONESTY SCORE</div><div style="font-size:13px" class="mu">${hit} of ${n} lean calls were right.<br>Trades: ${b.trades?b.win_rate+"% won of "+b.trades:"none yet"}.</div></div>`;
+ $("calib").innerHTML='<h3>Does confidence match reality?</h3>'+[["Under 60%",0,60],["60–69%",60,70],["70%+",70,101]].map(([l,lo,hi])=>{const a=LN.filter(x=>x.conf!=null&&x.conf>=lo&&x.conf<hi),h=a.filter(x=>x.ok).length,r=a.length?Math.round(h/a.length*100):null,cl=a.length?Math.round(a.reduce((m,x)=>m+x.conf,0)/a.length):null;
+  return `<div class="lean"><span style="width:84px">${l}</span><span class="mu" style="width:130px">${a.length} calls · said ${cl==null?"–":cl+"%"}</span><div class="bar" style="flex:1;margin:0 8px"><i style="width:${r||0}%"></i></div><b>${r==null?"–":r+"%"}</b></div>`}).join("");
+ $("audlog").innerHTML=n?LN.slice(-15).reverse().map(l=>`<div class="lean"><span class="mu">${clock(l.ws)}</span><span>${l.lean} ${l.conf!=null?Math.round(l.conf)+"%":""}</span><span class="mu">${l.o?money(l.o):"–"} → ${l.c?money(l.c):"–"}</span><span>${l.ok?"✅":"❌"}</span></div>`).join(""):'<div class="mu" style="padding:8px">Nothing to audit yet. Each finished round adds a row.</div>'}
+const G={c:null,cur:null,st:(()=>{try{return JSON.parse(lsGet("game"))||{n:0,you:0,bot:0,streak:0,best:0}}catch(e){return{n:0,you:0,bot:0,streak:0,best:0}}})()};
+async function gameNew(){
+ try{if(!G.c){const r=await fetch("https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300");G.c=(await r.json()).reverse()}
+  const i=14+Math.floor(Math.random()*(G.c.length-16));G.cur={ctx:G.c.slice(i-12,i),w:G.c[i]};drawGame()}
+ catch(e){$("gameBox").innerHTML='<div class="mu">Could not load past prices. Tap the tab again to retry.</div>';G.c=null;G.cur=null}}
+function drawGame(){
+ const g=G.cur,t=new Date(g.w[0]*1000).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+ $("gameBox").innerHTML=`<h3>Call it: a past 5-minute window</h3><canvas id="gc"></canvas><div style="font-size:13px;margin:6px 0">Window of ${t} opens at <b>${money(g.w[3])}</b>. The line shows the 12 windows before it. Closes higher or lower?</div><div class="buys"><button class="buy u" id="gUp">UP</button><button class="buy d" id="gDn">DOWN</button></div><div id="gRes"></div>`;
+ const cv=$("gc"),d=devicePixelRatio||1;cv.width=cv.clientWidth*d;cv.height=110*d;const x=cv.getContext("2d"),v=g.ctx.map(c=>c[4]).concat(g.w[3]),mn=Math.min(...v),mx=Math.max(...v);
+ x.lineWidth=3*d;x.strokeStyle="#00e5ff";x.shadowColor="#00e5ff";x.shadowBlur=10;x.beginPath();
+ v.forEach((q,i)=>{const px=i/(v.length-1)*cv.width,py=cv.height-8*d-(q-mn)/((mx-mn)||1)*(cv.height-16*d);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke();
+ $("gUp").onclick=()=>gPick("UP");$("gDn").onclick=()=>gPick("DOWN")}
+function gPick(side){
+ const g=G.cur,w=g.w,c=g.ctx,real=w[4]>=w[3]?"UP":"DOWN",bot=c[11][4]-c[9][3]>=0?"UP":"DOWN",st=G.st;
+ st.n++;const ok=side===real,bo=bot===real;if(ok){st.you++;st.streak++;st.best=Math.max(st.best,st.streak)}else st.streak=0;if(bo)st.bot++;lsSet("game",JSON.stringify(st));
+ $("gUp").disabled=$("gDn").disabled=true;
+ $("gRes").innerHTML=`<div class="say">It closed <b class="${cls(w[4]-w[3])}">${real}</b>: ${money(w[3])} → ${money(w[4])}.<br>You said ${side} ${ok?"✅":"❌"} · Auto-call said ${bot} ${bo?"✅":"❌"}<div class="mu" style="font-size:11px">Auto-call = follows the last 3 windows' direction.</div></div><button class="btn pri" id="gNext" style="margin-top:8px">Next window</button>`;
+ $("gNext").onclick=gameNew;gameBoard();if(ok)party(true)}
+function gameBoard(){
+ const s=G.st,w=LN.length,wh=LN.filter(l=>l.ok).length;
+ const rows=[["🧑 You",s.n,s.you],["🤖 Auto-call",s.n,s.bot],["🌴 Winston live leans",w,wh]].map(([nm,n,h])=>({nm,n,a:n?h/n:-1})).sort((x,y)=>y.a-x.a);
+ $("board").innerHTML=rows.map((r,i)=>`<div class="lean"><span>${["🥇","🥈","🥉"][i]} ${r.nm}</span><span class="mu">${r.n} calls</span><b>${r.a<0?"–":Math.round(r.a*100)+"%"}</b></div>`).join("")+`<div class="mu" style="font-size:12px;margin-top:8px">Your streak: ${s.streak} (best ${s.best}). Scores are saved in this browser only.</div>`}
 /* render */
 function render(s){
  const live=s.config.live_trading,sg=s.signal||{};
  document.body.className=s.window_open&&s.btc_price?(s.btc_price>=s.window_open?"bull":"bear"):"";
- if(s.btc_price){const b=$("btc");b.textContent=money(s.btc_price);
+ if(s.btc_price){const b=$("btc");roll(b,s.btc_price,money);
   if(lastBtc&&s.btc_price!==lastBtc){b.className="price "+(s.btc_price>lastBtc?"fu":"fd");setTimeout(()=>b.className="price",300)}lastBtc=s.btc_price}
  $("delta").innerHTML=(s.window_open&&s.btc_price)?`<span class="${cls(s.delta_pct)}">${s.delta_pct>=0?"▲":"▼"} ${Math.abs(s.delta_pct).toFixed(3)}%</span> <span class="mu">${s.partial?"joined late, sitting this round out":""}</span>`:"";
  $("chT").textContent="TARGET "+(s.window_open?money(s.window_open):"–");$("chB").textContent="BTC "+(s.btc_price?money(s.btc_price):"–");
- $("chG").textContent="GAP "+(s.window_open?usd(s.delta_usd):"–");$("chG").className="chip "+(s.delta_usd>=0?"up":"dn");
+ s.window_open?roll($("chG"),s.delta_usd,v=>"GAP "+usd(v)):($("chG").textContent="GAP –");$("chG").className="chip "+(s.delta_usd>=0?"up":"dn");
  $("chW").textContent=s.delta_usd>=0?"▲ UP WINNING":"▼ DOWN WINNING";$("chW").className="chip "+(s.delta_usd>=0?"up":"dn");
  const ok=s.feed.age!=null&&s.feed.age<8;$("conn").className="pill "+(ok?"ok":"bad");$("conn").textContent=ok?"● LIVE FEED":"● FEED STALE";
  $("modeSw").className="mode"+(live?" live":"");$("modeTxt").textContent=live?"🔴 LIVE · REAL MONEY":"PAPER";
  $("banner").className="banner"+(live?" show":"");document.title=(live?"🔴 ":"")+"Winston";
  const up=s.prices.up,dn=s.prices.down;
  if(up!=null&&dn!=null){const t=up+dn;$("oddU").style.flexBasis=up/t*100+"%";$("oddD").style.flexBasis=dn/t*100+"%"}
- $("oddU").textContent="UP "+pct(up);$("oddD").textContent="DOWN "+pct(dn);
+ roll($("oddU"),up,v=>"UP "+pct(v));roll($("oddD"),dn,v=>"DOWN "+pct(v));
  const p=s.position;
  $("buyUp").disabled=!!p||up==null;$("buyDown").disabled=!!p||dn==null;
  $("buyUp").textContent="Buy UP · "+pct(up);$("buyDown").textContent="Buy DOWN · "+pct(dn);
@@ -309,7 +362,7 @@ function render(s){
  $("noT").style.display=s.recent_trades.length?"none":"block";
  $("ledger").innerHTML=s.recent_trades.slice(0,30).map((t,i)=>`<tr data-i="${i}"><td>${clock(t.closed_at)}</td><td><span class="tag ${t.mode}">${t.mode.toUpperCase()}</span></td><td><span class="side ${t.side}">${t.side}</span></td><td>${pct(t.entry)} → ${pct(t.exit)}</td><td>${esc(t.reason)}</td><td style="text-align:right" class="${cls(t.pnl)}"><b>${usd(t.pnl)}</b></td></tr>`).join("");
  document.querySelectorAll("#ledger tr").forEach(tr=>tr.onclick=()=>openTrade(S.recent_trades[+tr.dataset.i]));
- trackLean(s);const k=streaks(s),b=s.scoreboard;
+ trackLean(s);renderAudit(s);renderTF(s);const k=streaks(s),b=s.scoreboard;
  const seg=`₿ ${s.btc_price?money(s.btc_price):"…"} ★ TARGET ${s.window_open?money(s.window_open):"…"} ★ LEAN ${sg.lean||"…"}${sg.confidence?" "+Math.round(sg.confidence)+"%":""} ★ TODAY ${usd(b.pnl_today)} ★ WIN RATE ${b.trades?b.win_rate+"%":"–"} ★ STREAK ${k.ts}${k.ts>=3?" 🔥":""} ★ ${live?"LIVE":"PAPER"} MODE ★ WELCOME TO VICE CITY ★ `;
  $("tickin").textContent=seg.repeat(4);
  const nt=s.recent_trades[0];
@@ -317,14 +370,14 @@ function render(s){
  updateChart(s)}
 
 setInterval(()=>{const e=(Date.now()/1000+offset)%300,l=300-e;
- $("cd").textContent=Math.floor(l/60)+":"+String(Math.floor(l%60)).padStart(2,"0");
- $("cd").className="dig"+(l<30?" hot":"");$("cdl").textContent=l<30?"LOCK IT IN!":"ROUND CLOSES";
+ const ct=Math.floor(l/60)+":"+String(Math.floor(l%60)).padStart(2,"0");if($("cd").textContent!==ct){$("cd").textContent=ct;$("cd").classList.remove("tick");void $("cd").offsetWidth;$("cd").classList.add("tick")}
+ $("cd").classList.toggle("hot",l<30);$("cdl").textContent=l<30?"LOCK IT IN!":"ROUND CLOSES";
  $("sun").style.transform="translateY("+(e/300*110)+"px)"},250);
 async function tick(){
  if(busy)return;busy=true;
  try{S=await api("/state");offset=S.server_time-Date.now()/1000;render(S)}
  catch(e){console.error("Winston:",e);$("conn").className="pill bad";$("conn").textContent="● OFFLINE"}
  finally{busy=false}}
-initChart();if(!TOKEN)openSet();tick();setInterval(tick,1000);
+initChart();if(!TOKEN)openSet();loadTF();setInterval(loadTF,20000);tick();setInterval(tick,1000);
 </script>
 </body></html>
