@@ -116,7 +116,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 <div class="logo">WINSTON<small>VICE CITY DESK · 5-MIN BTC</small></div>
 <div><div class="price" id="btc">…</div><div id="delta" style="font-size:12px;font-weight:700"></div></div>
 <div class="grow"></div>
-<span class="pill" id="conn">connecting</span>
+<span class="pill" id="bal" style="display:none"></span><span class="pill" id="conn">connecting</span>
 <button class="mode" id="modeSw"><span id="modeTxt">PAPER</span></button>
 <button class="btn" id="gear" title="Connection">⚙</button>
 </div>
@@ -174,7 +174,7 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const lsGet=k=>{try{return localStorage.getItem(k)}catch(e){return null}},lsSet=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
 let API=(lsGet("deskApi")||window.location.origin).replace(/\/+$/,""),TOKEN=lsGet("deskToken")||"";
-let S=null,offset=0,busy=false,built=false,activeSl=null,lastClosed=null,lastBtc=0;
+let CV=0,S=null,offset=0,busy=false,built=false,activeSl=null,lastClosed=null,lastBtc=0;
 const usd=x=>(x<0?"-":"+")+"$"+Math.abs(x).toFixed(2),plain=x=>"$"+Number(x).toFixed(2),money=x=>"$"+Number(x).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
 const pct=p=>p==null?"–":Math.round(p*100)+"%",cls=x=>x>=0?"up":"dn";
 const clock=t=>new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"});
@@ -260,6 +260,8 @@ const SL=[["min_confidence","Min confidence",0,100,.1,v=>(+v).toFixed(1)+"%"],["
 ["stake_usd","Stake per trade",1,5000,1,v=>"$"+(+v).toFixed(0)],["take_profit","Take profit",.005,2,.005,v=>"+"+(v*100).toFixed(1)+"%"],["stop_loss","Stop loss",.005,1,.005,v=>"-"+(v*100).toFixed(1)+"%"],
 ["force_exit_sec","Force sell at",1,299,1,v=>(+v).toFixed(0)+"s"]];
 const TS={min_confidence:"How sure the signal must be (0-100%) before the bot enters. Lower = more trades but more noise.",min_btc_move:"How far BTC must already be from the round's target, in %, before entering. 0 turns this filter off.",entry_min_sec:"Earliest second of the 5-minute round the bot may enter. 0 = right from the start.",entry_max_sec:"Latest second it may enter. Late entries are often already priced in.",max_entry_price:"Won't buy a side that costs more than this. At 100% you pay $1 to win $1, so there is no profit left.",min_entry_price:"Won't buy a side cheaper than this. Very cheap sides are long shots.",stake_usd:"Dollars spent per trade. Live mode also respects its hard cap.",take_profit:"Auto-sells when the position is up this much.",stop_loss:"Auto-sells when the position is down this much.",force_exit_sec:"Sells anything still open at this second of the round, before the market closes."};
+SL.push(["max_trades_per_window","Max trades per round",1,20,1,v=>(+v).toFixed(0)],["reentry_cooldown_sec","Re-entry cooldown",0,120,1,v=>(+v).toFixed(0)+"s"],["inval_buffer_pct","Exit if BTC flips past target by",0,0.5,.001,v=>(+v).toFixed(3)+"%"],["inval_hold_sec","...for at least",0,60,.5,v=>(+v).toFixed(1)+"s"],["min_hold_sec","Min hold before price stop",0,60,.5,v=>(+v).toFixed(1)+"s"],["trail_pct","Trailing lock after take-profit",.005,.5,.005,v=>(v*100).toFixed(1)+" pts"],["hold_to_settle_price","Ride to settlement above",.5,1,.005,v=>(v*100).toFixed(1)+"%"],["max_stake_pct_balance","Max stake % of balance",0,100,1,v=>(+v).toFixed(0)+"%"],["max_live_stake","Hard cap per live trade",1,10000,1,v=>"$"+(+v).toFixed(0)],["max_daily_loss","Daily loss limit (live)",1,100000,1,v=>"$"+(+v).toFixed(0)]);
+Object.assign(TS,{max_trades_per_window:"How many entries Winston may take in one 5-minute round.",reentry_cooldown_sec:"Wait this long after an exit before a new entry in the same round.",inval_buffer_pct:"If BTC crosses to the wrong side of the target by more than this, the trade is considered invalid.",inval_hold_sec:"The gap must stay flipped this long before Winston exits. Filters out noise.",min_hold_sec:"The emergency price stop is ignored for this many seconds after entry.",trail_pct:"After take-profit is reached, sell if the price falls this far from its peak.",hold_to_settle_price:"Above this price (and BTC on our side) Winston holds to settlement instead of selling.",max_stake_pct_balance:"Live only: a trade never exceeds this % of your Polymarket balance. 0 = off.",max_live_stake:"Live only: absolute dollar cap per trade, whatever the stake slider says.",max_daily_loss:"Live only: when today's realized loss reaches this, live trading switches off automatically."});
 const PRE={chill:{min_btc_move:.04,min_confidence:65,entry_min_sec:45,entry_max_sec:200,max_entry_price:.78,min_entry_price:.30,winston_veto:true},
 bal:{min_btc_move:.02,min_confidence:55,entry_min_sec:20,entry_max_sec:240,max_entry_price:.85,min_entry_price:.20,winston_veto:true},
 hunt:{min_btc_move:.005,min_confidence:30,entry_min_sec:5,entry_max_sec:270,max_entry_price:.93,min_entry_price:.10,winston_veto:false},
@@ -267,10 +269,10 @@ max:{min_btc_move:0,min_confidence:1,entry_min_sec:0,entry_max_sec:290,max_entry
 fire:{min_btc_move:0,min_confidence:0,entry_min_sec:0,entry_max_sec:299,max_entry_price:.99,min_entry_price:.01,winston_veto:false}};
 document.querySelectorAll(".pre button").forEach(b=>b.onclick=async()=>{
  if(S&&S.config.live_trading&&!confirm("LIVE mode is on. Change how often Winston trades with real money?"))return;
- try{await post("/config",PRE[b.dataset.p]);toast(b.textContent+" mode set");built=false;tick()}catch(e){toast(e.message,true)}});
+ try{const r=await post("/config",PRE[b.dataset.p]);CV=Math.max(CV,r.config_version||0);toast(b.textContent+" mode set");built=false;tick()}catch(e){toast(e.message,true)}});
 function buildSl(c){
  $("sliders").innerHTML=SL.map(([k,l,mn,mx,st,f])=>`<div class="sl" data-tip="${TS[k]}"><label><span>${l}</span><b id="v_${k}">${f(c[k])}</b></label><div class="row" style="flex-wrap:nowrap;gap:6px"><input type="range" id="s_${k}" min="${mn}" max="${mx}" step="${st}" value="${c[k]}"><input type="number" class="num" id="n_${k}" step="${st}" value="${c[k]}"></div></div>`).join("");
- SL.forEach(([k,,,,,f])=>{const r=$("s_"+k),n=$("n_"+k),send=async v=>{try{await post("/config",{[k]:v})}catch(e){toast(e.message,true)}activeSl=null};
+ SL.forEach(([k,,,,,f])=>{const r=$("s_"+k),n=$("n_"+k),send=async v=>{try{const r=await post("/config",{[k]:v});CV=Math.max(CV,r.config_version||0)}catch(e){toast(e.message,true)}activeSl=null};
   r.oninput=()=>{activeSl=k;n.value=r.value;$("v_"+k).textContent=f(+r.value)};r.onchange=()=>send(+r.value);
   n.onfocus=()=>activeSl=k;n.onchange=()=>{const v=+n.value;if(n.value===""||isNaN(v))return;r.value=v;$("v_"+k).textContent=f(v);send(v)}});built=true}
 function syncSl(c){SL.forEach(([k,,,,,f])=>{if(activeSl===k)return;const r=$("s_"+k),n=$("n_"+k);if(!r)return;r.value=c[k];n.value=c[k];$("v_"+k).textContent=f(c[k])})}
@@ -342,6 +344,7 @@ function render(s){
  s.window_open?roll($("chG"),s.delta_usd,v=>"GAP "+usd(v)):($("chG").textContent="GAP –");$("chG").className="chip "+(s.delta_usd>=0?"up":"dn");
  $("chW").textContent=s.delta_usd>=0?"▲ UP WINNING":"▼ DOWN WINNING";$("chW").className="chip "+(s.delta_usd>=0?"up":"dn");
  const ok=s.feed.age!=null&&s.feed.age<8;$("conn").className="pill "+(ok?"ok":"bad");$("conn").textContent=ok?"● LIVE FEED":"● FEED STALE";
+ const bl=s.balance;if(bl&&bl.linked){const v=bl.cash!=null?bl.cash:bl.buying_power;$("bal").style.display="";$("bal").textContent=bl.status==="ok"&&v!=null?"💰 "+money(v):"💰 "+bl.status;$("bal").dataset.tip="Polymarket cash"+(bl.portfolio_value!=null?" · portfolio "+money(bl.portfolio_value):"")+(bl.error?" · "+bl.error:"")}else $("bal").style.display="none";
  $("modeSw").className="mode"+(live?" live":"");$("modeTxt").textContent=live?"🔴 LIVE · REAL MONEY":"PAPER";
  $("banner").className="banner"+(live?" show":"");document.title=(live?"🔴 ":"")+"Winston";
  const up=s.prices.up,dn=s.prices.down;
@@ -359,7 +362,7 @@ function render(s){
  const lt=(s.chat||[]).slice().reverse().find(m=>m.who==="terry"),tt=lt?lt.text:(sg.source==="terrycalls"?(sg.detail||"No call yet."):"No call from Terry yet.");
  $("sayT").textContent=tt;$("terryTxt").textContent=tt;$("sayW").textContent=s.thinking;$("think").textContent=s.thinking;
  $("feed").innerHTML=(s.chat||[]).slice().reverse().map(t=>`<div class="t-${t.tone}"><small>${clock(t.ts)}</small>${t.who==="terry"?"🔮 ":t.who==="winston"?"🤖 ":""}${esc(t.text)}</div>`).join("");
- if(!built)buildSl(s.config);else syncSl(s.config);
+ if(!built)buildSl(s.config);else if((s.config_version||0)>=CV)syncSl(s.config);
  $("gate").innerHTML=gates(s).map(([l,o])=>`<div class="${o?"ok":"no"}">${o?"✅":"⛔"} ${l}</div>`).join("");
  $("pause").textContent=s.config.paused?"▶ Resume":"⏸ Pause";$("pause").className="btn"+(s.config.paused?" pri":"");$("veto").textContent="Winston veto: "+(s.config.winston_veto?"ON":"OFF");
  document.querySelectorAll("#seg button").forEach(b=>b.className=b.dataset.src===s.config.signal_source?"on":"");
