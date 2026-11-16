@@ -1,35 +1,29 @@
 """
-Winston -- 5-Minute BTC Up/Down desk. 24/7 cloud engine (FastAPI + asyncio).
+Winston v5 -- 5-Minute BTC Up/Down desk. 24/7 cloud engine (FastAPI + asyncio).
 
-Runs without a browser open. Serves index.html at "/" and a JSON API for it.
-
-Modes
-  PAPER (default): simulated fills at the quoted contract price, TP / SL / expiry.
-  LIVE: real orders through the polymarket-us SDK. Always starts OFF after every
-        restart, needs a typed confirmation, and a daily-loss circuit breaker
-        flips it back to PAPER automatically.
-
-Signal sources
-  terrycalls : Winston follows Terry's call/lock for the 5m market, then double-checks
-               it against BTC's actual move before deciding (the "veto").
-  momentum   : Winston's own rule (BTC % move from the window open + timing + a
-               simple probability model).
-
-Odds sources (best first): Polymarket live midpoint -> Terry prices -> Polymarket
-event prices -> a model estimate (flagged ESTIMATED, never used for live orders).
+WHAT CHANGED vs v4 (maps to the 7 pillars in the brief)
+  1. Latency/desync : Coinbase WS and Polymarket CLOB WS are the PRIMARY feeds (REST is fallback only).
+                      Window maths uses one epoch clock to the millisecond; the window open is the last
+                      tick at/before the boundary; /state carries server_time_ms + feed latency.
+  2. Multi-trade    : no more one-and-done. Up to `max_trades_per_window` entries per window, with a
+                      cooldown, and re-entries must have BTC back on the right side of the target.
+  3. Smart exits    : structural exit when the BTC-vs-target gap flips against us (buffer + hold time),
+                      emergency price stop only after `min_hold_sec`, trailing profit lock instead of a
+                      fixed clip, and "ride to settlement" once the contract is >= `hold_to_settle_price`.
+  4. Instant entry  : the engine is event-driven; every Coinbase / Polymarket tick wakes it immediately.
+                      The live SDK client and market slugs are pre-warmed.
+  5. State contract : /state keeps every v4 key and shape (additive fields only). `config_version`
+                      lets the UI ignore stale polls so sliders never snap back.
+  6. Live controls  : stake, hard cap, % of balance cap, remaining-loss-budget sizing, daily loss
+                      circuit breaker, /kill switch. Live always boots OFF.
+  7. Account        : balance/portfolio fetched from the SDK (best-effort field mapping, see
+                      fetch_account), exposed as state["balance"]. /account, /account/link, /account/unlink.
 
 Environment variables
-  ADMIN_TOKEN            password for the dashboard/API (REQUIRED for live mode)
-  TERRY_API_KEY          terrycalls.com API key (free plan is fine)
-  POLYMARKET_KEY_ID      Polymarket US API key id        (live mode only)
-  POLYMARKET_SECRET_KEY  Polymarket US secret key        (live mode only)
-  BOT_NAME               name shown on the dashboard (default Winston)
-  DATA_DIR               where to keep desk_state.json (use a Railway volume to
-                         keep trade history across redeploys)
-  TZ_NAME                timezone for "PnL today" (default America/Los_Angeles)
-  Optional live tuning: LIVE_SLIPPAGE, LIVE_TIF, LIVE_SLUG_TEMPLATE,
-  LIVE_UP_OPEN_INTENT, LIVE_UP_CLOSE_INTENT, LIVE_DOWN_OPEN_INTENT,
-  LIVE_DOWN_CLOSE_INTENT, EST_VOL_PCT, TERRY_POLL_SEC
+  ADMIN_TOKEN (required for live) | TERRY_API_KEY | POLYMARKET_KEY_ID | POLYMARKET_SECRET_KEY
+  BOT_NAME | DATA_DIR | TZ_NAME | EST_VOL_PCT | TERRY_POLL_SEC | ACCOUNT_POLL_SEC
+  LIVE_SLIPPAGE | LIVE_TIF | LIVE_SLUG_TEMPLATE | LIVE_FILL_WAIT_SEC | PM_WS_URL
+  LIVE_UP_OPEN_INTENT / LIVE_UP_CLOSE_INTENT / LIVE_DOWN_OPEN_INTENT / LIVE_DOWN_CLOSE_INTENT
 """
 
 import asyncio
@@ -40,6 +34,7 @@ import os
 import re
 import secrets
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -53,82 +48,92 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-try:  # live trading SDK is optional until you flip the switch
+try:  # live SDK is optional until you flip the switch
     from polymarket_us import PolymarketUS
     POLY_SDK = True
 except Exception:  # noqa: BLE001
     PolymarketUS = None
     POLY_SDK = False
 
-# ----------------------------------------------------------------- SETTINGS --
+# ================================================================= SETTINGS ==
 WINDOW = 300
 BOT_NAME = os.environ.get("BOT_NAME", "Winston").strip() or "Winston"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR)))
 STATE_FILE = DATA_DIR / "desk_state.json"
+EVENT_FILE = DATA_DIR / "events.jsonl"
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "America/Los_Angeles"))
 
-EST_VOL_PCT = float(os.environ.get("EST_VOL_PCT", "0.10"))      # typical 5-min BTC stdev, in %
-TERRY_POLL_SEC = max(3.0, float(os.environ.get("TERRY_POLL_SEC", "5")))  # 5s = 17,280/day (< 20,000 free cap)
+EST_VOL_PCT = float(os.environ.get("EST_VOL_PCT", "0.10"))
+TERRY_POLL_SEC = max(3.0, float(os.environ.get("TERRY_POLL_SEC", "5")))
+ACCOUNT_POLL_SEC = max(5.0, float(os.environ.get("ACCOUNT_POLL_SEC", "15")))
 LIVE_SLIPPAGE = float(os.environ.get("LIVE_SLIPPAGE", "0.02"))
 LIVE_TIF = os.environ.get("LIVE_TIF", "TIME_IN_FORCE_GOOD_TILL_CANCEL")
 LIVE_SLUG_TEMPLATE = os.environ.get("LIVE_SLUG_TEMPLATE", "btc-updown-5m-{ts}")
+LIVE_FILL_WAIT = float(os.environ.get("LIVE_FILL_WAIT_SEC", "2.5"))
+PM_WS_URL = os.environ.get("PM_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
 LIVE_INTENTS = {
     ("UP", "open"): os.environ.get("LIVE_UP_OPEN_INTENT", "ORDER_INTENT_BUY_LONG"),
     ("UP", "close"): os.environ.get("LIVE_UP_CLOSE_INTENT", "ORDER_INTENT_SELL_LONG"),
     ("DOWN", "open"): os.environ.get("LIVE_DOWN_OPEN_INTENT", "ORDER_INTENT_BUY_SHORT"),
     ("DOWN", "close"): os.environ.get("LIVE_DOWN_CLOSE_INTENT", "ORDER_INTENT_SELL_SHORT"),
 }
-# How old (seconds) a price may be before the next source down the list is used.
-FRESH_CLOB, FRESH_TERRY, FRESH_GAMMA = 6.0, 8.0, 15.0
+# Max age (s) before the next price source down the list is used.
+FRESH_PM_LINK, FRESH_CLOB, FRESH_TERRY, FRESH_GAMMA = 15.0, 6.0, 8.0, 15.0
 
 ADMIN_TOKEN_ENV = os.environ.get("ADMIN_TOKEN", "").strip()
 ADMIN_TOKEN = ADMIN_TOKEN_ENV or secrets.token_urlsafe(18)
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "stake_usd": 10.0,
-    "max_entry_price": 0.78,
-    "min_entry_price": 0.30,
-    "min_confidence": 65.0,
-    "take_profit": 0.08,
-    "stop_loss": 0.06,
-    "min_btc_move": 0.04,
-    "entry_min_sec": 45,
-    "entry_max_sec": 200,
-    "force_exit_sec": 250,
-    "fee_pct": 2.0,
-    "max_daily_loss": 30.0,
-    "max_live_stake": 25.0,
+    # entry
+    "min_confidence": 55.0, "min_btc_move": 0.02, "entry_min_sec": 5, "entry_max_sec": 200,
+    "max_entry_price": 0.85, "min_entry_price": 0.15,
+    # multi-trade
+    "max_trades_per_window": 3, "reentry_cooldown_sec": 6,
+    # exits
+    "take_profit": 0.10, "stop_loss": 0.20, "force_exit_sec": 270,
+    "inval_buffer_pct": 0.015, "inval_hold_sec": 4.0, "min_hold_sec": 3.0,
+    "trail_pct": 0.07, "hold_to_settle_price": 0.95,
+    # sizing / live safety
+    "stake_usd": 10.0, "fee_pct": 2.0, "max_daily_loss": 30.0, "max_live_stake": 25.0,
+    "max_stake_pct_balance": 25.0,
+    # modes
     "signal_source": "terrycalls" if os.environ.get("TERRY_API_KEY", "").strip() else "momentum",
-    "winston_veto": True,
-    "live_trading": False,
-    "paused": False,
+    "winston_veto": True, "live_trading": False, "paused": False,
 }
-RANGES = {
-    "stake_usd": (1.0, 1000.0), "max_entry_price": (0.05, 0.99), "min_entry_price": (0.01, 0.95),
-    "min_confidence": (50.0, 99.0), "take_profit": (0.01, 0.50), "stop_loss": (0.01, 0.50),
-    "min_btc_move": (0.0, 1.0), "entry_min_sec": (0, 290), "entry_max_sec": (10, 295),
-    "force_exit_sec": (30, 295), "fee_pct": (0.0, 10.0), "max_daily_loss": (1.0, 100000.0),
-    "max_live_stake": (1.0, 10000.0),
+RANGES = {  # kept wide so the dashboard sliders are never silently clamped
+    "stake_usd": (1.0, 5000.0), "max_entry_price": (0.01, 1.0), "min_entry_price": (0.0, 0.99),
+    "min_confidence": (0.0, 100.0), "take_profit": (0.005, 2.0), "stop_loss": (0.005, 1.0),
+    "min_btc_move": (0.0, 2.0), "entry_min_sec": (0, 299), "entry_max_sec": (0, 299),
+    "force_exit_sec": (1, 299), "fee_pct": (0.0, 10.0), "max_daily_loss": (1.0, 100000.0),
+    "max_live_stake": (1.0, 10000.0), "max_trades_per_window": (1, 20),
+    "reentry_cooldown_sec": (0.0, 120.0), "inval_buffer_pct": (0.0, 1.0), "inval_hold_sec": (0.0, 60.0),
+    "min_hold_sec": (0.0, 60.0), "trail_pct": (0.005, 1.0), "hold_to_settle_price": (0.5, 1.0),
+    "max_stake_pct_balance": (0.0, 100.0),
 }
-INT_KEYS = {"entry_min_sec", "entry_max_sec", "force_exit_sec"}
+INT_KEYS = {"entry_min_sec", "entry_max_sec", "force_exit_sec", "max_trades_per_window"}
 BOOL_KEYS = ("live_trading", "paused", "winston_veto")
 
 cfg: Dict[str, Any] = dict(DEFAULT_CONFIG)
+cfg_meta = {"version": 0, "updated": time.time()}
 
 st: Dict[str, Any] = {
-    "btc": None, "btc_ts": 0.0, "feed_source": "starting", "history": [], "odds_hist": [],
+    "btc": None, "btc_ts": 0.0, "feed_source": "starting", "latency_ms": None,
+    "ticks": deque(maxlen=600), "history": [], "odds_hist": [],
     "window_start": None, "window_open": None, "open_source": "", "partial": False,
-    "window_last_btc": None, "traded_window": None,
+    "win_trades": {}, "last_exit_ts": 0.0, "entry_block_until": 0.0,
     "terry": None, "terry_status": "starting", "terry_key": None,
     "gamma": {}, "gamma_status": "starting", "clob": None, "clob_status": "starting",
+    "books": {}, "pm_last_msg": 0.0, "pm_sub": set(), "pm_status": "starting",
     "last_quote": None, "last_move": 0.0, "signal": None,
     "position": None, "trades": [], "chat": [], "logs": [], "now_thinking": "Starting up…",
-    "client": None, "live_error": "", "close_fail_ts": 0.0, "last_kind": {}, "lock": None,
+    "client": None, "creds": None, "live_error": "", "close_fail_ts": 0.0, "last_kind": {},
+    "slug_ok": set(), "account": {"status": "not linked"},
+    "lock": None, "evt": None, "acct_evt": None,
 }
 
 
-# ------------------------------------------------------------------ HELPERS --
+# ================================================================= HELPERS ==
 def add_log(msg: str) -> None:
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     st["logs"].insert(0, line)
@@ -136,10 +141,21 @@ def add_log(msg: str) -> None:
     print(line, flush=True)
 
 
+def log_event(kind: str, **data: Any) -> None:
+    """Structured JSONL audit trail (entries, exits, breaker, config, errors)."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if EVENT_FILE.exists() and EVENT_FILE.stat().st_size > 5_000_000:
+            EVENT_FILE.replace(EVENT_FILE.with_suffix(".jsonl.1"))
+        with EVENT_FILE.open("a") as f:
+            f.write(json.dumps({"ts": round(time.time(), 3), "kind": kind, **data}, default=str) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def say(who: str, kind: str, text: str, tone: str = "wait") -> None:
-    """Add a line to the conversation. Repeats of the same 'kind' by the same speaker are skipped."""
     if who == "winston":
-        st["now_thinking"] = text  # the live 'typing' line always shows the latest thought
+        st["now_thinking"] = text
     if st["last_kind"].get(who) == kind:
         return
     st["last_kind"][who] = kind
@@ -155,12 +171,15 @@ def pc(p: float) -> str:
     return f"{p * 100:.0f}%"
 
 
+def window_of(t: float) -> int:
+    return int(t // WINDOW) * WINDOW
+
+
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
 def est_probs(move_pct: float, left: float):
-    """P(window finishes Up) given the current move and time left (random-walk model)."""
     sigma = EST_VOL_PCT * math.sqrt(max(left, 3.0) / WINDOW)
     p = min(0.98, max(0.02, norm_cdf(move_pct / sigma)))
     return p, 1.0 - p
@@ -205,6 +224,55 @@ def trade_date(t: Dict[str, Any]):
     return datetime.fromtimestamp(t["closed_at"], TZ).date()
 
 
+def fill_px(q: Dict[str, Any], side: str, kind: str) -> float:
+    """Realistic fill price: buys pay the ask, sells hit the bid; falls back to the midpoint."""
+    k = side.lower()
+    v = q.get(f"{k}_ask") if kind == "buy" else q.get(f"{k}_bid")
+    return float(v if v else q[k])
+
+
+def to_plain(o: Any) -> Any:
+    for n in ("model_dump", "dict"):
+        f = getattr(o, n, None)
+        if callable(f):
+            try:
+                return f()
+            except Exception:  # noqa: BLE001
+                pass
+    return o if isinstance(o, (dict, list, str, int, float)) else getattr(o, "__dict__", {})
+
+
+def _num(v: Any) -> Optional[float]:
+    if isinstance(v, dict):
+        return _num(v.get("value", v.get("amount")))
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def find_num(obj: Any, names: set, depth: int = 0) -> Optional[float]:
+    """Search a nested SDK response for the first numeric field whose name is in `names`."""
+    if depth > 4:
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k).lower().replace("_", "") in names:
+                n = _num(v)
+                if n is not None:
+                    return n
+        for v in obj.values():
+            r = find_num(v, names, depth + 1)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj[:20]:
+            r = find_num(v, names, depth + 1)
+            if r is not None:
+                return r
+    return None
+
+
 def clean_value(key: str, value: Any) -> Any:
     if key in RANGES:
         lo, hi = RANGES[key]
@@ -217,6 +285,12 @@ def clean_value(key: str, value: Any) -> Any:
     if key in BOOL_KEYS:
         return bool(value)
     raise ValueError(f"unknown setting {key}")
+
+
+def set_cfg(key: str, value: Any) -> None:
+    cfg[key] = clean_value(key, value)
+    cfg_meta["version"] += 1
+    cfg_meta["updated"] = time.time()
 
 
 def save_state() -> None:
@@ -247,11 +321,23 @@ def load_state() -> None:
     cfg["live_trading"] = False  # always boot into paper mode
 
 
+# --------------------------------------------------------------- live status --
+def creds():
+    if st["creds"]:
+        return st["creds"]
+    k, s = os.environ.get("POLYMARKET_KEY_ID", ""), os.environ.get("POLYMARKET_SECRET_KEY", "")
+    return (k, s) if k and s else None
+
+
+def linked() -> bool:
+    return POLY_SDK and creds() is not None
+
+
 def live_ready():
     if not POLY_SDK:
         return False, "polymarket-us SDK is not installed"
-    if not os.environ.get("POLYMARKET_KEY_ID") or not os.environ.get("POLYMARKET_SECRET_KEY"):
-        return False, "POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY are not set"
+    if creds() is None:
+        return False, "Polymarket keys are not set (env vars or /account/link)"
     if not ADMIN_TOKEN_ENV:
         return False, "set an ADMIN_TOKEN environment variable first"
     return True, "ready"
@@ -262,13 +348,19 @@ def live_pnl_today() -> float:
     return sum(t["pnl"] for t in st["trades"] if t.get("mode") == "live" and trade_date(t) == today)
 
 
+def loss_budget_left() -> float:
+    return cfg["max_daily_loss"] + live_pnl_today()
+
+
 def check_breaker() -> None:
     if cfg["live_trading"] and live_pnl_today() <= -cfg["max_daily_loss"]:
         cfg["live_trading"] = False
+        cfg_meta["version"] += 1
         save_state()
         add_log("CIRCUIT BREAKER: daily live loss limit hit. Switched back to PAPER mode.")
-        think("breaker", "🛑 We hit today's loss limit, so I've switched live trading OFF. "
-                         "I'm back in paper mode and I'll keep watching.", "loss")
+        log_event("breaker", pnl_today=live_pnl_today(), limit=cfg["max_daily_loss"])
+        think("breaker", "🛑 We hit today's loss limit, so live trading is OFF. "
+                         "I'm in paper mode and still watching.", "loss")
 
 
 def scoreboard(mode: str) -> Dict[str, Any]:
@@ -283,7 +375,7 @@ def scoreboard(mode: str) -> Dict[str, Any]:
             "avg_trade": round(total / n, 2) if n else 0.0}
 
 
-# ------------------------------------------------------------------- QUOTES --
+# ================================================================== QUOTES ==
 def terry_matches(t: Dict[str, Any], left: float) -> bool:
     sl = t["item"].get("seconds_left")
     if sl is None:
@@ -302,10 +394,28 @@ def terry_fresh() -> Optional[Dict[str, Any]]:
     return None
 
 
+def ws_quote(slug: str, now: float) -> Optional[Dict[str, Any]]:
+    """Primary source: live Polymarket order-book stream (best bid/ask for both contracts)."""
+    if now - st["pm_last_msg"] > FRESH_PM_LINK:
+        return None
+    tok = (st["gamma"].get(slug) or {}).get("tokens") or {}
+    u, d = st["books"].get(tok.get("up")), st["books"].get(tok.get("down"))
+    if not u or not d:
+        return None
+    ub, ua, db, da = u.get("bid"), u.get("ask"), d.get("bid"), d.get("ask")
+    if None in (ub, ua, db, da) or not (0 < ub <= ua < 1 and 0 < db <= da < 1):
+        return None  # one-sided / empty book: fall through to REST midpoint
+    return {"up": round((ub + ua) / 2, 4), "down": round((db + da) / 2, 4),
+            "up_bid": ub, "up_ask": ua, "down_bid": db, "down_ask": da,
+            "source": "polymarket-ws", "age": round(now - min(u["ts"], d["ts"]), 1)}
+
+
 def get_quote(left: float, move_pct: float) -> Dict[str, Any]:
-    """Best available contract prices for the CURRENT window, with where they came from."""
     now = time.time()
     slug = f"btc-updown-5m-{st['window_start']}"
+    q = ws_quote(slug, now)
+    if q:
+        return q
     c = st["clob"]
     if c and c["slug"] == slug and now - c["fetched"] <= FRESH_CLOB:
         return {"up": c["up"], "down": c["down"], "source": "polymarket-live", "age": round(now - c["fetched"], 1)}
@@ -317,8 +427,7 @@ def get_quote(left: float, move_pct: float) -> Dict[str, Any]:
             return {"up": up, "down": dn, "source": "terrycalls", "age": round(now - t["fetched"], 1)}
     g = st["gamma"].get(slug)
     if g and now - g["fetched"] <= FRESH_GAMMA and g["up"] is not None and g["down"] is not None:
-        return {"up": g["up"], "down"
-                : g["down"], "source": "polymarket", "age": round(now - g["fetched"], 1)}
+        return {"up": g["up"], "down": g["down"], "source": "polymarket", "age": round(now - g["fetched"], 1)}
     up, dn = est_probs(move_pct, left)
     return {"up": round(up, 3), "down": round(dn, 3), "source": "estimated", "age": 0.0}
 
@@ -330,11 +439,9 @@ def signal_snapshot(move: float, left: float) -> Dict[str, Any]:
         lean = "UP" if move >= 0 else "DOWN"
         conf = round(max(p_up, p_dn) * 100, 1)
         strong = abs(move) >= cfg["min_btc_move"]
-        if strong:
-            detail = f"BTC is {move:+.3f}% from the target. My model gives {lean} a {conf:.0f}% chance."
-        else:
-            detail = (f"BTC is only {move:+.3f}% from the target. I need at least "
-                      f"±{cfg['min_btc_move']:.2f}% before I consider a trade.")
+        detail = (f"BTC is {move:+.3f}% from the target. My model gives {lean} a {conf:.0f}% chance." if strong else
+                  f"BTC is only {move:+.3f}% from the target. I need at least ±{cfg['min_btc_move']:.3f}% "
+                  f"before I consider a trade.")
         return {"source": "momentum", "side": lean if strong else None, "lean": lean,
                 "confidence": conf, "status": "ready" if strong else "waiting", "detail": detail}
 
@@ -370,13 +477,10 @@ def signal_snapshot(move: float, left: float) -> Dict[str, Any]:
 
 
 def terry_announce() -> None:
-    """Put Terry's latest real call/lock/lean into the conversation (built only from his API fields)."""
-    t = st["terry"]
-    ws = st["window_start"]
+    t, ws = st["terry"], st["window_start"]
     if not t or ws is None:
         return
-    left = WINDOW - (time.time() - ws)
-    if not terry_matches(t, left):
+    if not terry_matches(t, WINDOW - (time.time() - ws)):
         return
     item = t["item"]
     status = str(item.get("status") or "waiting").lower()
@@ -401,16 +505,33 @@ def terry_announce() -> None:
     say("terry", str(key), text, "terry")
 
 
-# --------------------------------------------------------------- LIVE (SDK) --
+def adopt_price_to_beat() -> None:
+    """Terry's price-to-beat matches the settlement source better than a Coinbase tick, so adopt it
+    (once per window) if it's sane, even when we joined late."""
+    t, ws, cur = st["terry"], st["window_start"], st["window_open"]
+    if not t or ws is None or not cur or st["open_source"].startswith("terrycalls"):
+        return
+    if not terry_matches(t, WINDOW - (time.time() - ws)):
+        return
+    try:
+        ptb = float(t["item"].get("price_to_beat"))
+    except (TypeError, ValueError):
+        return
+    if ptb > 0 and abs(ptb - cur) / cur * 100 <= 0.15:
+        st["window_open"], st["open_source"], st["partial"] = ptb, "terrycalls price-to-beat", False
+        add_log(f"Target adopted from Terry price-to-beat: {ptb:,.2f}")
+
+
+# ============================================================ LIVE (SDK) ==
 def get_client():
     if st["client"] is None:
-        st["client"] = PolymarketUS(key_id=os.environ["POLYMARKET_KEY_ID"],
-                                    secret_key=os.environ["POLYMARKET_SECRET_KEY"])
+        k, s = creds()
+        st["client"] = PolymarketUS(key_id=k, secret_key=s)
     return st["client"]
 
 
 def live_slug() -> str:
-    ws = st["window_start"] or int(time.time()) // WINDOW * WINDOW
+    ws = st["window_start"] or window_of(time.time())
     t = terry_fresh()
     if t:
         m = t["item"].get("market")
@@ -432,46 +553,139 @@ def order_id(resp: Any) -> Optional[str]:
 
 def live_buy(slug: str, side: str, price: float, qty: int) -> Dict[str, Any]:
     client = get_client()
-    client.markets.retrieve_by_slug(slug)  # refuse to trade a market the exchange can't find
+    if slug not in st["slug_ok"]:  # validated ahead of time by the pre-warm loop when possible
+        client.markets.retrieve_by_slug(slug)
+        st["slug_ok"].add(slug)
     limit = min(0.99, round(price + LIVE_SLIPPAGE, 2))
     resp = client.orders.create({
-        "marketSlug": slug,
-        "intent": LIVE_INTENTS[(side, "open")],
-        "type": "ORDER_TYPE_LIMIT",
-        "price": {"value": f"{limit:.2f}", "currency": "USD"},
-        "quantity": int(qty),
-        "tif": LIVE_TIF,
+        "marketSlug": slug, "intent": LIVE_INTENTS[(side, "open")], "type": "ORDER_TYPE_LIMIT",
+        "price": {"value": f"{limit:.2f}", "currency": "USD"}, "quantity": int(qty), "tif": LIVE_TIF,
     })
     return {"order_id": order_id(resp), "slug": slug, "limit": limit}
+
+
+def live_cancel(oid: Optional[str], slug: str) -> None:
+    if oid:
+        try:
+            get_client().orders.cancel(oid, {"marketSlug": slug})
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def live_fill_qty(oid: Optional[str], want: int) -> Optional[float]:
+    """Best-effort fill check. Returns filled quantity, or None if the SDK can't tell us."""
+    if not oid:
+        return None
+    client, got, end = get_client(), None, time.time() + LIVE_FILL_WAIT
+    while time.time() < end:
+        try:
+            fn = getattr(client.orders, "retrieve", None) or getattr(client.orders, "get", None)
+            if fn is None:
+                return None
+            q = find_num(to_plain(fn(oid)), {"cumquantity", "filledquantity", "filled", "executedquantity", "cumqty"})
+            if q is not None:
+                got = q
+                if q >= want:
+                    return q
+        except Exception:  # noqa: BLE001
+            return got
+        time.sleep(0.3)
+    return got
 
 
 def live_sell(pos: Dict[str, Any], price: float) -> Dict[str, Any]:
     client = get_client()
     limit = max(0.01, round(price - LIVE_SLIPPAGE, 2))
     resp = client.orders.create({
-        "marketSlug": pos["slug"],
-        "intent": LIVE_INTENTS[(pos["side"], "close")],
-        "type": "ORDER_TYPE_LIMIT",
-        "price": {"value": f"{limit:.2f}", "currency": "USD"},
-        "quantity": int(pos["shares"]),
-        "tif": LIVE_TIF,
+        "marketSlug": pos["slug"], "intent": LIVE_INTENTS[(pos["side"], "close")], "type": "ORDER_TYPE_LIMIT",
+        "price": {"value": f"{limit:.2f}", "currency": "USD"}, "quantity": int(pos["shares"]), "tif": LIVE_TIF,
     })
-    if pos.get("order_id"):  # clean up any unfilled remainder of the entry order
-        try:
-            client.orders.cancel(pos["order_id"], {"marketSlug": pos["slug"]})
-        except Exception:  # noqa: BLE001
-            pass
+    live_cancel(pos.get("order_id"), pos["slug"])  # clean up any unfilled remainder of the entry
     return {"order_id": order_id(resp), "limit": limit}
 
 
-# ------------------------------------------------------------------ TRADING --
+# ============================================================== ACCOUNT ==
+def fetch_account() -> Dict[str, Any]:
+    """Pull cash / buying power / portfolio value. The SDK's method and field names aren't documented
+    in this repo, so several likely call paths and field names are tried. state['balance']['fields']
+    lists the top-level keys returned, so a wrong mapping is easy to spot on the first run."""
+    client, raw, last = get_client(), None, None
+    for path in ("account.balances", "account.balance", "accounts.balances", "portfolio.balances"):
+        try:
+            obj = client
+            for part in path.split("."):
+                obj = getattr(obj, part)
+            raw = to_plain(obj() if callable(obj) else obj)
+            break
+        except Exception as e:  # noqa: BLE001
+            last = e
+    if raw is None:
+        raise RuntimeError(f"no balance method found on the SDK ({last})")
+    return {
+        "cash": find_num(raw, {"cash", "cashbalance", "availablebalance", "available", "balance", "currentbalance"}),
+        "buying_power": find_num(raw, {"buyingpower", "availabletotrade", "availablebuyingpower"}),
+        "portfolio_value": find_num(raw, {"portfoliovalue", "totalvalue", "equity", "netliquidation", "totalbalance"}),
+        "fields": sorted(raw.keys())[:12] if isinstance(raw, dict) else [],
+    }
+
+
+def spendable() -> Optional[float]:
+    a = st["account"]
+    if a.get("status") != "ok" or time.time() - a.get("ts", 0) > 120:
+        return None
+    return a.get("buying_power") if a.get("buying_power") is not None else a.get("cash")
+
+
+async def account_task() -> None:
+    """Keeps the balance fresh and pre-warms the live client + the next markets (so entries are instant)."""
+    while True:
+        if linked():
+            try:
+                data = await asyncio.to_thread(fetch_account)
+                st["account"] = {**data, "ts": time.time(), "status": "ok", "error": ""}
+                ws = window_of(time.time())
+                for w in (ws, ws + WINDOW):
+                    slug = LIVE_SLUG_TEMPLATE.format(ts=w)
+                    if slug not in st["slug_ok"]:
+                        try:
+                            await asyncio.to_thread(lambda s=slug: get_client().markets.retrieve_by_slug(s))
+                            st["slug_ok"].add(slug)
+                        except Exception:  # noqa: BLE001
+                            pass
+                if len(st["slug_ok"]) > 40:
+                    st["slug_ok"].clear()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                st["account"] = {**st["account"], "status": "error", "error": str(e)[:200]}
+        else:
+            st["account"] = {"status": "not linked"}
+        try:
+            await asyncio.wait_for(st["acct_evt"].wait(), ACCOUNT_POLL_SEC)
+        except asyncio.TimeoutError:
+            pass
+        st["acct_evt"].clear()
+
+
+# ============================================================== TRADING ==
+def live_stake(price: float) -> float:
+    """Hard-capped live stake: setting, hard cap, % of balance, and what's left of today's loss budget."""
+    stake = min(cfg["stake_usd"], cfg["max_live_stake"], loss_budget_left())
+    bal = spendable()
+    if bal is not None:
+        stake = min(stake, bal * 0.98)
+        if cfg["max_stake_pct_balance"] > 0:
+            stake = min(stake, bal * cfg["max_stake_pct_balance"] / 100.0)
+    return stake
+
+
 async def open_position(side: str, quote: Dict[str, Any], *, manual: bool, confidence: Optional[float],
                         move_pct: float, stake: Optional[float] = None, why: str = "") -> Dict[str, Any]:
     async with st["lock"]:
         if st["position"] is not None:
             raise RuntimeError("a position is already open")
         mode = "live" if cfg["live_trading"] else "paper"
-        price = quote[side.lower()]
+        price = fill_px(quote, side, "buy")
         stake = float(stake if stake is not None else cfg["stake_usd"])
         order: Dict[str, Any] = {}
         slug = f"btc-updown-5m-{st['window_start']}"
@@ -481,31 +695,47 @@ async def open_position(side: str, quote: Dict[str, Any], *, manual: bool, confi
                 raise RuntimeError(f"live trading not ready: {reason}")
             if quote["source"] == "estimated":
                 raise RuntimeError("no real market price available, so I won't place a live order")
-            stake = min(stake, cfg["max_live_stake"])
+            check_breaker()
+            if not cfg["live_trading"]:
+                raise RuntimeError("daily loss limit reached")
+            stake = min(stake, live_stake(price))
             qty = int(stake // price)
             if qty < 1:
-                raise RuntimeError("stake is too small to buy one contract at this price")
+                raise RuntimeError("stake is too small to buy one contract (check balance and loss budget)")
             slug = live_slug()
             order = await asyncio.to_thread(live_buy, slug, side, price, qty)
             shares: float = qty
+            filled = await asyncio.to_thread(live_fill_qty, order.get("order_id"), qty)
+            if filled is None:
+                add_log("WARNING: could not verify the fill with the SDK, assuming a full fill.")
+            elif filled <= 0:
+                await asyncio.to_thread(live_cancel, order.get("order_id"), slug)
+                raise RuntimeError("entry order did not fill in time, cancelled")
+            elif filled < qty:
+                await asyncio.to_thread(live_cancel, order.get("order_id"), slug)
+                shares = filled
         else:
             shares = stake / price
         now = time.time()
+        ws = st["window_start"]
+        st["win_trades"][ws] = st["win_trades"].get(ws, 0) + 1
         pos = {
-            "id": f"t{int(now * 1000)}", "mode": mode, "side": side, "slug": slug,
-            "window_start": st["window_start"], "opened_at": now, "entry": round(price, 4),
-            "shares": shares, "stake": round(shares * price, 2), "price_source": quote["source"],
-            "btc_open": st["window_open"], "btc_at_entry": st["btc"], "move_pct_at_entry": round(move_pct, 4),
-            "signal_source": "manual" if manual else cfg["signal_source"], "confidence": confidence,
-            "manual": manual, "order_id": order.get("order_id"), "fee_pct": cfg["fee_pct"],
+            "id": f"t{int(now * 1000)}", "mode": mode, "side": side, "slug": slug, "window_start": ws,
+            "opened_at": now, "entry": round(price, 4), "shares": shares, "stake": round(shares * price, 2),
+            "price_source": quote["source"], "btc_open": st["window_open"], "btc_at_entry": st["btc"],
+            "move_pct_at_entry": round(move_pct, 4), "signal_source": "manual" if manual else cfg["signal_source"],
+            "confidence": confidence, "manual": manual, "order_id": order.get("order_id"),
+            "fee_pct": cfg["fee_pct"], "peak": round(price, 4), "inval_since": None,
+            "n_in_window": st["win_trades"][ws],
         }
         st["position"] = pos
-        st["traded_window"] = st["window_start"]
         add_log(f"[{mode.upper()}] BUY {side} @ {price:.2f} x{shares:.2f} (${pos['stake']:.2f}) "
-                f"{'MANUAL' if manual else cfg['signal_source']}")
-        intro = why or "You asked for this one."
-        think(f"entered{pos['id']}", f"🟢 {intro} Buying {side} with ${pos['stake']:.2f} "
-                                     f"[{mode.upper()}].", "go")
+                f"#{pos['n_in_window']} {'MANUAL' if manual else cfg['signal_source']}")
+        log_event("entry", **{k: pos[k] for k in ("id", "mode", "side", "entry", "shares", "stake", "price_source",
+                                                   "move_pct_at_entry", "confidence", "signal_source",
+                                                   "n_in_window")}, why=why)
+        think(f"entered{pos['id']}", f"🟢 {why or 'You asked for this one.'} Buying {side} with "
+                                     f"${pos['stake']:.2f} [{mode.upper()}].", "go")
         return pos
 
 
@@ -523,6 +753,7 @@ async def close_position(price: float, reason: str, settle: bool = False,
                 st["close_fail_ts"] = time.time()
                 st["live_error"] = str(e)
                 add_log(f"LIVE close failed: {e}")
+                log_event("error", where="live_sell", error=str(e))
                 think("closefail", f"⚠️ I couldn't close the live position ({e}). I'll keep retrying.", "loss")
                 if raise_on_fail:
                     raise HTTPException(status_code=502, detail=f"Live close failed: {e}")
@@ -530,33 +761,50 @@ async def close_position(price: float, reason: str, settle: bool = False,
         fee = pos["stake"] * pos["fee_pct"] / 100.0
         pnl = pos["shares"] * (price - pos["entry"]) - fee
         now = time.time()
-        trade = {
-            **pos, "exit": round(price, 4), "reason": reason, "pnl": round(pnl, 4), "fee": round(fee, 4),
-            "closed_at": now, "held_sec": round(now - pos["opened_at"], 1), "btc_at_exit": st["btc"],
-            "close_order_id": info.get("order_id"), "settled": settle,
-        }
+        trade = {**pos, "exit": round(price, 4), "reason": reason, "pnl": round(pnl, 4), "fee": round(fee, 4),
+                 "closed_at": now, "held_sec": round(now - pos["opened_at"], 1), "btc_at_exit": st["btc"],
+                 "close_order_id": info.get("order_id"), "settled": settle}
         st["trades"].append(trade)
         del st["trades"][:-2000]
         st["position"] = None
+        st["last_exit_ts"] = now
         save_state()
         add_log(f"[{pos['mode'].upper()}] SELL {pos['side']} @ {price:.2f} ({reason}) pnl ${pnl:+.2f}")
+        log_event("exit", id=pos["id"], mode=pos["mode"], side=pos["side"], exit=trade["exit"], reason=reason,
+                  pnl=trade["pnl"], held_sec=trade["held_sec"], settled=settle)
         think(f"exit{trade['id']}", f"{'✅' if pnl > 0 else '❌'} Sold {pos['side']} at {pc(price)} ({reason}). "
                                     f"{pnl:+.2f} USD after estimated fees.", "win" if pnl > 0 else "loss")
         if pos["mode"] == "live":
+            st["acct_evt"].set()
             check_breaker()
         return trade
+
+
+def price_at(ts: float) -> Optional[float]:
+    """Last tick at or before `ts` (so window boundaries use the true boundary price, not a late tick)."""
+    best = None
+    for t, p in st["ticks"]:
+        if t <= ts:
+            best = (t, p)
+        else:
+            break
+    return best[1] if best and ts - best[0] <= 5 else None
 
 
 async def on_new_window(ws: int, elapsed: float, btc: float) -> None:
     pos = st["position"]
     if pos is not None and st["window_start"] is not None:
-        final = st["window_last_btc"] or btc
-        opened = st["window_open"] or final
-        up_won = final >= opened
-        won = (pos["side"] == "UP") == up_won
+        q = st["last_quote"] or {}
+        mid = q.get(pos["side"].lower())
+        if q.get("source") not in (None, "estimated") and mid is not None and (mid >= 0.9 or mid <= 0.1):
+            won = mid >= 0.9  # the market's own final price is the best read on the real settlement
+        else:
+            final = price_at(ws) or btc
+            won = (pos["side"] == "UP") == (final >= (st["window_open"] or final))
         await close_position(1.0 if won else 0.0, f"window expired ({'won' if won else 'lost'})", settle=True)
     st["window_start"] = ws
-    open_price, source, partial = btc, "live feed", False
+    st["win_trades"] = {k: v for k, v in st["win_trades"].items() if k >= ws - 3 * WINDOW}
+    open_price, source, partial = (price_at(ws) or btc) if elapsed <= 3 else btc, "live feed", False
     if elapsed > 3:
         t = terry_fresh()
         ptb = None
@@ -572,146 +820,160 @@ async def on_new_window(ws: int, elapsed: float, btc: float) -> None:
     st["window_open"], st["open_source"], st["partial"] = open_price, source, partial
     add_log(f"New window {ws}: target {open_price:,.2f} ({source})" + (" - joined late, sitting out" if partial else ""))
     say("sys", f"w{ws}", f"New 5-minute window · target ${open_price:,.2f}", "sys")
+    adopt_price_to_beat()
 
 
-async def manage_position(quote: Dict[str, Any], elapsed: float) -> None:
-    pos = st["position"]
-    price = quote[pos["side"].lower()]
-    delta = price - pos["entry"]
-    same = price_class(quote["source"]) == price_class(pos["price_source"])
-    reason = None
-    if elapsed >= cfg["force_exit_sec"]:
-        reason = "time exit"
-    elif same and delta >= cfg["take_profit"]:
-        reason = "take profit"
-    elif same and -delta >= cfg["stop_loss"]:
-        reason = "stop loss"
-    if reason:
-        if time.time() - st["close_fail_ts"] < 3:
-            return
-        await close_position(price, reason)
+async def manage_position(q: Dict[str, Any], elapsed: float, move: float) -> None:
+    """Exits are driven by the target-to-BTC gap first, contract price second."""
+    pos, now = st["position"], time.time()
+    side = pos["side"]
+    mid, bid = q[side.lower()], fill_px(q, side, "sell")
+    held = now - pos["opened_at"]
+    same = price_class(q["source"]) == price_class(pos["price_source"])
+    pos["peak"] = max(pos.get("peak", pos["entry"]), mid)
+    edge = move if side == "UP" else -move  # % BTC is on our side of the target
+    if edge < -cfg["inval_buffer_pct"]:
+        pos["inval_since"] = pos.get("inval_since") or now
     else:
-        think(f"hold{pos['id']}", f"Holding {pos['side']} from {pc(pos['entry'])}. Now {pc(price)} "
-                                  f"({delta * 100:+.0f} pts). I sell at +{cfg['take_profit'] * 100:.0f} pts or "
-                                  f"-{cfg['stop_loss'] * 100:.0f} pts, or by {cfg['force_exit_sec']}s.", "info")
+        pos["inval_since"] = None
+    riding = mid >= cfg["hold_to_settle_price"] and edge > 0  # near-certain winner: let it settle
+    armed = pos["peak"] >= pos["entry"] + cfg["take_profit"]
+    reason = None
+    if pos["inval_since"] and now - pos["inval_since"] >= cfg["inval_hold_sec"]:
+        reason = "gap invalidated"
+    elif same and held >= cfg["min_hold_sec"] and pos["entry"] - mid >= cfg["stop_loss"]:
+        reason = "emergency stop"
+    elif same and armed and not riding and (pos["peak"] - mid >= cfg["trail_pct"] or edge <= 0):
+        reason = "profit locked"
+    elif elapsed >= cfg["force_exit_sec"] and not riding:
+        reason = "time exit"
+    if reason:
+        if now - st["close_fail_ts"] >= 3:
+            await close_position(bid, reason)
+        return
+    state = "riding to settlement" if riding else ("trailing a winner" if armed else "holding")
+    think(f"hold{pos['id']}:{state}", f"{state.capitalize()} {side} from {pc(pos['entry'])}, now {pc(mid)}. "
+                                     f"BTC is {edge:+.3f}% on my side of the target. I exit if the gap flips "
+                                     f"for {cfg['inval_hold_sec']:.0f}s, not on price noise.", "info")
 
 
-async def consider_entry(quote: Dict[str, Any], elapsed: float, move: float) -> None:
-    ws = st["window_start"]
-    sig = st["signal"]
+async def consider_entry(q: Dict[str, Any], elapsed: float, move: float) -> None:
+    ws, sig, now = st["window_start"], st["signal"], time.time()
     side, conf = sig["side"], sig["confidence"]
     terry = cfg["signal_source"] == "terrycalls"
     view = (f"{'Terry says' if terry else 'My read says'} {side} at {conf:.0f}%"
             if side and conf is not None else sig["detail"])
+    n = st["win_trades"].get(ws, 0)
     if cfg["paused"]:
-        think("paused", "I'm paused, so I'm only watching. Hit Resume when you want me trading.", "wait")
-        return
+        return think("paused", "I'm paused, so I'm only watching. Hit Resume when you want me trading.")
     if st["partial"]:
-        think("partial", "I joined this window late, so I don't trust the target price. "
-                         "I'm sitting this one out and I'll be ready for the next.", "wait")
-        return
-    if st["traded_window"] == ws:
-        think(f"done{ws}", "That's my trade for this window. I'll wait for the next one.", "wait")
+        return think("partial", "I joined this window late, so I don't trust the target price. Sitting this one out.")
+    if n >= cfg["max_trades_per_window"]:
+        return think(f"cap{ws}", f"That's my {n} trade(s) for this window. On to the next one.")
+    if n and now - st["last_exit_ts"] < cfg["reentry_cooldown_sec"]:
+        return think(f"cool{ws}:{n}", "Short cooldown after my last exit, then I'll look for another entry.")
+    if now < st["entry_block_until"]:
         return
     if elapsed < cfg["entry_min_sec"]:
-        think(f"early:{side}", f"{view}. It's only {int(elapsed)}s in and early moves are noisy, so I'll wait "
-                               f"until {cfg['entry_min_sec']}s before I decide.", "wait")
-        return
+        return think(f"early:{side}", f"{view}. Only {int(elapsed)}s in, I start at {cfg['entry_min_sec']}s.")
     if elapsed > cfg["entry_max_sec"]:
-        think("late", "It's too late in this window to enter safely. On to the next one.", "wait")
-        return
+        return think("late", "Too late in this window to enter safely. On to the next one.")
     if side is None:
-        think(f"sig:{sig['status']}:{sig.get('lean')}", f"{sig['detail']} I'll keep watching.", "wait")
-        return
+        return think(f"sig:{sig['status']}:{sig.get('lean')}", f"{sig['detail']} I'll keep watching.")
     if conf is None or conf < cfg["min_confidence"]:
-        think(f"lowconf:{side}", f"{view}, but I need at least {cfg['min_confidence']:.0f}%. Passing for now.", "wait")
-        return
-    if terry and cfg["winston_veto"]:
-        against = (side == "UP" and move <= -cfg["min_btc_move"]) or (side == "DOWN" and move >= cfg["min_btc_move"])
-        if against:
-            think(f"veto:{side}", f"{view}, but BTC is {move:+.3f}% vs the target, which points the other way. "
-                                  f"I don't take calls the price disagrees with, so I'm overruling this one.", "info")
-            return
-    price = quote[side.lower()]
+        return think(f"lowconf:{side}", f"{view}, but I need at least {cfg['min_confidence']:.0f}%. Passing for now.")
+    edge = move if side == "UP" else -move
+    if terry and cfg["winston_veto"] and edge <= -cfg["min_btc_move"]:
+        return think(f"veto:{side}", f"{view}, but BTC is {move:+.3f}% vs the target, pointing the other way. "
+                                     f"I don't take calls the price disagrees with.", "info")
+    if n and edge < cfg["inval_buffer_pct"]:
+        return think(f"norecover{ws}:{n}", "I'm out of my last trade and BTC hasn't moved back to that side of the "
+                                           "target yet, so I'm waiting for the gap to confirm.")
+    price = fill_px(q, side, "buy")
     if price > cfg["max_entry_price"]:
-        think(f"pricey:{side}", f"{view}. But {side} already costs {pc(price)}, over my {pc(cfg['max_entry_price'])} "
-                                f"limit, so the move is priced in. Passing.", "wait")
-        return
+        return think(f"pricey:{side}", f"{view}. But {side} already costs {pc(price)}, over my "
+                                       f"{pc(cfg['max_entry_price'])} limit, so the move is priced in. Passing.")
     if price < cfg["min_entry_price"]:
-        think(f"cheap:{side}", f"{view}. But the crowd only gives {side} {pc(price)}, so they strongly disagree. "
-                               f"Passing.", "wait")
-        return
-    if cfg["live_trading"]:
-        if quote["source"] == "estimated":
-            think("estlive", "I don't have a real market price right now, so I won't place a live order.", "wait")
-            return
-        if live_pnl_today() <= -cfg["max_daily_loss"]:
-            check_breaker()
-            return
-    agrees = (side == "UP" and move >= 0) or (side == "DOWN" and move <= 0)
-    why = (f"{view}, and BTC {'agrees' if agrees else 'is flat-ish'} ({move:+.3f}% vs the target). "
-           f"{side} costs {pc(price)}, inside my limits.")
+        return think(f"cheap:{side}", f"{view}. But the crowd only gives {side} {pc(price)}, so they strongly "
+                                      f"disagree. Passing.")
+    if cfg["live_trading"] and q["source"] == "estimated":
+        return think("estlive", "No real market price right now, so I won't place a live order.")
+    why = (f"{view}, BTC {move:+.3f}% vs the target, {side} costs {pc(price)}"
+           + (f" (re-entry #{n + 1})" if n else "") + ".")
     try:
-        await open_position(side, quote, manual=False, confidence=conf, move_pct=move, why=why)
+        await open_position(side, q, manual=False, confidence=conf, move_pct=move, why=why)
     except Exception as e:  # noqa: BLE001
-        st["traded_window"] = ws  # don't hammer the exchange every second
+        st["entry_block_until"] = time.time() + 10  # don't hammer the exchange every tick
         add_log(f"Entry failed: {e}")
-        think(f"entryfail{ws}", f"⚠️ I wanted to buy {side} but it failed: {e}", "loss")
+        log_event("error", where="entry", error=str(e))
+        think(f"entryfail{ws}:{int(now)}", f"⚠️ I wanted to buy {side} but it failed: {e}", "loss")
 
 
 async def tick() -> None:
-    now = time.time()
-    btc = st["btc"]
+    now, btc = time.time(), st["btc"]
     if btc is None or now - st["btc_ts"] > 20:
-        think("nofeed", "The BTC price feed is down or stale. I won't trade blind.", "wait")
+        think("nofeed", "The BTC price feed is down or stale. I won't trade blind.")
         return
-    ts = int(now)
-    h = st["history"]
+    ts, h = int(now), st["history"]
     new_second = not h or h[-1][0] != ts
     if new_second:
         h.append([ts, btc])
         del h[:-1800]
-    ws = ts // WINDOW * WINDOW
+    else:
+        h[-1][1] = btc
+    ws = window_of(now)
     elapsed = now - ws
-    left = WINDOW - elapsed
     if st["window_start"] != ws:
         await on_new_window(ws, elapsed, btc)
-    st["window_last_btc"] = btc
     open_price = st["window_open"]
     move = (btc - open_price) / open_price * 100.0
-    quote = get_quote(left, move)
-    st["last_quote"], st["last_move"] = quote, move
+    q = get_quote(WINDOW - elapsed, move)
+    st["last_quote"], st["last_move"] = q, move
     if new_second:
-        total = quote["up"] + quote["down"]
-        st["odds_hist"].append([ts, round(quote["up"] / total * 100.0, 1)])
+        total = q["up"] + q["down"]
+        st["odds_hist"].append([ts, round(q["up"] / total * 100.0, 1)])
         del st["odds_hist"][:-900]
-    st["signal"] = signal_snapshot(move, left)
+    st["signal"] = signal_snapshot(move, WINDOW - elapsed)
     if st["position"] is not None:
-        await manage_position(quote, elapsed)
+        await manage_position(q, elapsed, move)
     else:
-        await consider_entry(quote, elapsed, move)
+        await consider_entry(q, elapsed, move)
 
 
-# -------------------------------------------------------------- BACKGROUND --
-def on_price(p: float, source: str) -> None:
-    st["btc"], st["btc_ts"], st["feed_source"] = p, time.time(), source
+# =========================================================== BACKGROUND ==
+def on_price(p: float, source: str, ex_ts: Optional[float] = None) -> None:
+    t = time.time()
+    st["btc"], st["btc_ts"], st["feed_source"] = p, t, source
+    st["ticks"].append((t, p))
+    if ex_ts:
+        lat = (t - ex_ts) * 1000.0
+        st["latency_ms"] = lat if st["latency_ms"] is None else st["latency_ms"] * 0.9 + lat * 0.1
+    st["evt"].set()  # wake the engine NOW: this is what makes entries instant
 
 
 async def feed_task() -> None:
-    uri = "wss://ws-feed.exchange.coinbase.com"
+    delay = 1.0
     while True:
         try:
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=20, max_size=2 ** 20) as ws:
+            async with websockets.connect("wss://ws-feed.exchange.coinbase.com", ping_interval=20,
+                                          ping_timeout=20, max_size=2 ** 20) as ws:
                 await ws.send(json.dumps({"type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["ticker"]}))
                 async for raw in ws:
                     m = json.loads(raw)
                     if m.get("type") == "ticker" and m.get("price"):
-                        on_price(float(m["price"]), "coinbase-ws")
+                        delay = 1.0
+                        ex = None
+                        try:
+                            ex = datetime.fromisoformat(m["time"].replace("Z", "+00:00")).timestamp()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        on_price(float(m["price"]), "coinbase-ws", ex)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             st["feed_source"] = f"reconnecting ({type(e).__name__})"
-            await asyncio.sleep(2)
+        await asyncio.sleep(delay)
+        delay = min(15.0, delay * 2)  # exponential backoff
 
 
 def fetch_spot() -> float:
@@ -721,6 +983,7 @@ def fetch_spot() -> float:
 
 
 async def rest_task() -> None:
+    """Fallback only: used while the WebSocket is silent for >4s."""
     while True:
         await asyncio.sleep(2)
         if time.time() - st["btc_ts"] > 4:
@@ -730,10 +993,100 @@ async def rest_task() -> None:
                 pass
 
 
+def pm_update(asset: str, bid: Optional[float] = None, ask: Optional[float] = None) -> None:
+    b = st["books"].setdefault(asset, {})
+    if bid is not None:
+        b["bid"] = bid
+    if ask is not None:
+        b["ask"] = ask
+    b["ts"] = time.time()
+
+
+def _f(v: Any) -> Optional[float]:
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def pm_handle(m: Dict[str, Any]) -> None:
+    et = m.get("event_type")
+    if et == "book" and m.get("asset_id"):
+        bids = [float(x["price"]) for x in m.get("bids", []) if float(x.get("size", 0)) > 0]
+        asks = [float(x["price"]) for x in m.get("asks", []) if float(x.get("size", 0)) > 0]
+        pm_update(m["asset_id"], max(bids) if bids else 0.0, min(asks) if asks else 1.0)
+    elif et == "price_change":
+        for c in m.get("price_changes", []):
+            if c.get("asset_id"):
+                pm_update(c["asset_id"], _f(c.get("best_bid")), _f(c.get("best_ask")))
+    elif et == "best_bid_ask" and m.get("asset_id"):
+        pm_update(m["asset_id"], _f(m.get("best_bid")), _f(m.get("best_ask")))
+    else:
+        return
+    st["evt"].set()
+
+
+def pm_tokens() -> set:
+    out = set()
+    for g in st["gamma"].values():
+        out.update((g.get("tokens") or {}).values())
+    return out
+
+
+async def pm_ws_task() -> None:
+    """Primary odds source: Polymarket order-book stream. Re-subscribes as new windows' markets appear."""
+    delay = 1.0
+    while True:
+        helpers = []
+        try:
+            async with websockets.connect(PM_WS_URL, ping_interval=None, max_size=2 ** 22) as ws:
+                st["pm_sub"] = set()
+                st["pm_status"] = "connected"
+
+                async def pinger():
+                    while True:
+                        await asyncio.sleep(10)
+                        await ws.send("PING")
+
+                async def subscriber():
+                    first = True
+                    while True:
+                        new = pm_tokens() - st["pm_sub"]
+                        if new:
+                            msg = ({"assets_ids": sorted(new), "type": "market"} if first
+                                   else {"assets_ids": sorted(new), "operation": "subscribe"})
+                            await ws.send(json.dumps(msg))
+                            st["pm_sub"] |= new
+                            first = False
+                        await asyncio.sleep(0.5)
+
+                helpers = [asyncio.create_task(pinger()), asyncio.create_task(subscriber())]
+                async for raw in ws:
+                    st["pm_last_msg"] = time.time()
+                    delay = 1.0
+                    if raw in ("PONG", b"PONG"):
+                        continue
+                    try:
+                        data = json.loads(raw)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for m in (data if isinstance(data, list) else [data]):
+                        if isinstance(m, dict):
+                            pm_handle(m)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            st["pm_status"] = f"reconnecting ({type(e).__name__})"
+        finally:
+            for t in helpers:
+                t.cancel()
+        await asyncio.sleep(delay)
+        delay = min(15.0, delay * 2)
+
+
 def fetch_terry() -> Dict[str, Any]:
     r = requests.get("https://terrycalls.com/api/v1/calls", params={"horizon": "5m"},
-                     headers={"X-API-Key": os.environ["TERRY_API_KEY"].strip(), "Accept": "application/json"},
-                     timeout=6)
+                     headers={"X-API-Key": os.environ["TERRY_API_KEY"].strip(), "Accept": "application/json"}, timeout=6)
     if r.status_code == 429:
         raise RuntimeError("rate limited")
     r.raise_for_status()
@@ -749,17 +1102,15 @@ async def terry_task() -> None:
             continue
         try:
             data = await asyncio.to_thread(fetch_terry)
-            item = None
-            for m in data.get("markets", []):
-                if str(m.get("horizon", "")).lower().startswith("5"):
-                    item = m
-                    break
+            item = next((m for m in data.get("markets", []) if str(m.get("horizon", "")).lower().startswith("5")), None)
             if item is None:
                 st["terry_status"] = "no 5m market in response"
             else:
                 st["terry"] = {"item": item, "fetched": time.time(), "stale": bool(data.get("stale"))}
                 st["terry_status"] = "stale" if data.get("stale") else "ok"
                 terry_announce()
+                adopt_price_to_beat()
+                st["evt"].set()
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -776,8 +1127,7 @@ def fetch_gamma(slug: str) -> Dict[str, Any]:
     if not data:
         raise RuntimeError("market not listed yet")
     market = data[0]["markets"][0]
-    outcomes = market["outcomes"]
-    prices = market["outcomePrices"]
+    outcomes, prices = market["outcomes"], market["outcomePrices"]
     outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
     prices = json.loads(prices) if isinstance(prices, str) else prices
     mapped = {str(o).lower(): norm_price(p) for o, p in zip(outcomes, prices)}
@@ -789,14 +1139,13 @@ def fetch_gamma(slug: str) -> Dict[str, Any]:
             tokens = {str(o).lower(): str(i) for o, i in zip(outcomes, ids)}
         except Exception:  # noqa: BLE001
             tokens = {}
-    return {"slug": slug, "up": mapped.get("up"), "down": mapped.get("down"), "tokens": tokens,
-            "fetched": time.time()}
+    return {"slug": slug, "up": mapped.get("up"), "down": mapped.get("down"), "tokens": tokens, "fetched": time.time()}
 
 
 async def gamma_task() -> None:
-    """Keeps the current AND next window's market cached so odds are ready the moment a window rolls."""
+    """Caches current AND next window's market so token ids are known (and subscribed) before the roll."""
     while True:
-        base = int(time.time()) // WINDOW * WINDOW
+        base = window_of(time.time())
         for i, w in enumerate((base, base + WINDOW)):
             slug = f"btc-updown-5m-{w}"
             try:
@@ -811,7 +1160,8 @@ async def gamma_task() -> None:
         for k in list(st["gamma"]):
             try:
                 if int(k.rsplit("-", 1)[1]) < base - WINDOW:
-                    del st["gamma"][k]
+                    for tok in (st["gamma"].pop(k).get("tokens") or {}).values():
+                        st["books"].pop(tok, None)
             except Exception:  # noqa: BLE001
                 st["gamma"].pop(k, None)
         await asyncio.sleep(3)
@@ -824,21 +1174,25 @@ def fetch_mid(token: str) -> Optional[float]:
 
 
 async def clob_task() -> None:
-    """Fast (1.5s) live midpoint for the current window's Up and Down contracts."""
+    """REST midpoint fallback. Skips itself while the order-book stream is healthy."""
     while True:
         try:
-            slug = f"btc-updown-5m-{int(time.time()) // WINDOW * WINDOW}"
-            tok = (st["gamma"].get(slug) or {}).get("tokens") or {}
-            if tok.get("up") and tok.get("down"):
-                up, dn = await asyncio.gather(asyncio.to_thread(fetch_mid, tok["up"]),
-                                              asyncio.to_thread(fetch_mid, tok["down"]))
-                if up is not None and dn is not None:
-                    st["clob"] = {"slug": slug, "up": up, "down": dn, "fetched": time.time()}
-                    st["clob_status"] = "ok"
-                else:
-                    st["clob_status"] = "no midpoint yet"
+            slug = f"btc-updown-5m-{window_of(time.time())}"
+            if ws_quote(slug, time.time()):
+                st["clob_status"] = "idle (ws ok)"
             else:
-                st["clob_status"] = "waiting for market ids"
+                tok = (st["gamma"].get(slug) or {}).get("tokens") or {}
+                if tok.get("up") and tok.get("down"):
+                    up, dn = await asyncio.gather(asyncio.to_thread(fetch_mid, tok["up"]),
+                                                  asyncio.to_thread(fetch_mid, tok["down"]))
+                    if up is not None and dn is not None:
+                        st["clob"] = {"slug": slug, "up": up, "down": dn, "fetched": time.time()}
+                        st["clob_status"] = "ok"
+                        st["evt"].set()
+                    else:
+                        st["clob_status"] = "no midpoint yet"
+                else:
+                    st["clob_status"] = "waiting for market ids"
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -847,27 +1201,34 @@ async def clob_task() -> None:
 
 
 async def engine() -> None:
+    """Event-driven: wakes on every price / order-book update, with a 250ms heartbeat for timers."""
     add_log(f"{BOT_NAME}'s 24/7 engine started (paper mode).")
     while True:
-        t0 = time.time()
+        try:
+            await asyncio.wait_for(st["evt"].wait(), 0.25)
+        except asyncio.TimeoutError:
+            pass
+        st["evt"].clear()
         try:
             await tick()
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             add_log(f"Engine error: {type(e).__name__}: {e}")
-        await asyncio.sleep(max(0.05, 1.0 - (time.time() - t0)))
+            log_event("error", where="engine", error=f"{type(e).__name__}: {e}")
+        await asyncio.sleep(0.02)  # coalesce bursts of ticks
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    st["lock"] = asyncio.Lock()
+    st["lock"], st["evt"], st["acct_evt"] = asyncio.Lock(), asyncio.Event(), asyncio.Event()
     load_state()
     say("sys", "boot", f"{BOT_NAME} is online · paper mode", "sys")
     if not ADMIN_TOKEN_ENV:
         print(f"\n*** ADMIN_TOKEN not set. Temporary dashboard password for this run: {ADMIN_TOKEN}\n"
               f"*** Set ADMIN_TOKEN in your environment to keep it (required for live trading).\n", flush=True)
-    tasks = [asyncio.create_task(f()) for f in (feed_task, rest_task, terry_task, gamma_task, clob_task, engine)]
+    tasks = [asyncio.create_task(f()) for f in
+             (feed_task, rest_task, pm_ws_task, terry_task, gamma_task, clob_task, account_task, engine)]
     try:
         yield
     finally:
@@ -875,7 +1236,8 @@ async def lifespan(_app: FastAPI):
             t.cancel()
 
 
-app = FastAPI(title=f"{BOT_NAME} · 5-Minute BTC Up/Down Desk", version="4.0", lifespan=lifespan)
+# ================================================================== API ==
+app = FastAPI(title=f"{BOT_NAME} · 5-Minute BTC Up/Down Desk", version="5.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -899,6 +1261,14 @@ class ConfigUpdate(BaseModel):
     fee_pct: Optional[float] = None
     max_daily_loss: Optional[float] = None
     max_live_stake: Optional[float] = None
+    max_stake_pct_balance: Optional[float] = None
+    max_trades_per_window: Optional[float] = None
+    reentry_cooldown_sec: Optional[float] = None
+    inval_buffer_pct: Optional[float] = None
+    inval_hold_sec: Optional[float] = None
+    min_hold_sec: Optional[float] = None
+    trail_pct: Optional[float] = None
+    hold_to_settle_price: Optional[float] = None
     signal_source: Optional[str] = None
     winston_veto: Optional[bool] = None
     live_trading: Optional[bool] = None
@@ -911,6 +1281,11 @@ class ManualTrade(BaseModel):
     stake_usd: Optional[float] = None
 
 
+class LinkAccount(BaseModel):
+    key_id: str
+    secret_key: str
+
+
 def dump(model: BaseModel) -> Dict[str, Any]:
     fn = getattr(model, "model_dump", None) or model.dict
     return {k: v for k, v in fn().items() if v is not None}
@@ -921,16 +1296,17 @@ def position_view() -> Optional[Dict[str, Any]]:
     if not pos:
         return None
     q = st["last_quote"] or {}
-    cur = q.get(pos["side"].lower())
+    k = pos["side"].lower()
     view = dict(pos)
-    view["current"] = cur
+    view["current"] = q.get(k)
     view["held_sec"] = round(time.time() - pos["opened_at"], 1)
     view["tp_price"] = round(min(0.99, pos["entry"] + cfg["take_profit"]), 2)
     view["sl_price"] = round(max(0.01, pos["entry"] - cfg["stop_loss"]), 2)
-    if cur is not None:
+    if q.get(k) is not None:
+        sell = fill_px(q, pos["side"], "sell")
         fee = pos["stake"] * pos["fee_pct"] / 100.0
-        view["value"] = round(pos["shares"] * cur, 2)
-        view["unrealized_pnl"] = round(pos["shares"] * (cur - pos["entry"]) - fee, 2)
+        view["value"] = round(pos["shares"] * sell, 2)
+        view["unrealized_pnl"] = round(pos["shares"] * (sell - pos["entry"]) - fee, 2)
         view["unrealized_pct"] = round(view["unrealized_pnl"] / pos["stake"] * 100, 1) if pos["stake"] else 0.0
     return view
 
@@ -949,10 +1325,17 @@ def markers_view(since: float) -> list:
     return out
 
 
+def balance_view() -> Dict[str, Any]:
+    a = st["account"]
+    return {"linked": linked(), "status": a.get("status", "not linked"), "cash": a.get("cash"),
+            "buying_power": a.get("buying_power"), "portfolio_value": a.get("portfolio_value"),
+            "age": round(time.time() - a["ts"], 1) if a.get("ts") else None,
+            "error": a.get("error", ""), "fields": a.get("fields", [])}
+
+
 def build_state(since: Optional[int] = None) -> Dict[str, Any]:
-    """`since` = newest chart timestamp the browser already has; only newer points are sent."""
     now = time.time()
-    ws = st["window_start"] or int(now) // WINDOW * WINDOW
+    ws = st["window_start"] or window_of(now)
     left = max(0.0, WINDOW - (now - ws))
     btc, open_price = st["btc"], st["window_open"]
     q = st["last_quote"] or {}
@@ -963,19 +1346,25 @@ def build_state(since: Optional[int] = None) -> Dict[str, Any]:
     lo = floor if full else since + 1
     up, dn = q.get("up"), q.get("down")
     tot = (up + dn) if up is not None and dn is not None else None
+    n_win = st["win_trades"].get(ws, 0)
     return {
-        "name": BOT_NAME, "server_time": now, "mode": mode,
-        "btc_price": btc, "window_start": ws, "window_end": ws + WINDOW, "seconds_left": round(left, 1),
+        "name": BOT_NAME, "server_time": now, "server_time_ms": int(now * 1000), "mode": mode,
+        "btc_price": btc, "window_start": ws, "window_end": ws + WINDOW,
+        "window_start_ms": ws * 1000, "window_end_ms": (ws + WINDOW) * 1000, "seconds_left": round(left, 3),
         "window_open": open_price, "open_source": st["open_source"], "partial": st["partial"],
         "delta_pct": round(st["last_move"], 4),
         "delta_usd": round(btc - open_price, 2) if btc and open_price else 0.0,
-        "feed": {"source": st["feed_source"], "age": round(now - st["btc_ts"], 1) if st["btc_ts"] else None},
+        "feed": {"source": st["feed_source"], "age": round(now - st["btc_ts"], 1) if st["btc_ts"] else None,
+                 "latency_ms": round(st["latency_ms"]) if st["latency_ms"] is not None else None,
+                 "polymarket_ws": st["pm_status"]},
         "prices": {"up": up, "down": dn, "source": q.get("source", "none"), "age": q.get("age"),
+                   "up_bid": q.get("up_bid"), "up_ask": q.get("up_ask"),
+                   "down_bid": q.get("down_bid"), "down_ask": q.get("down_ask"),
                    "norm_up": round(up / tot * 100, 1) if tot else None,
                    "norm_down": round(dn / tot * 100, 1) if tot else None},
         "signal": st["signal"],
         "terry": {"enabled": bool(os.environ.get("TERRY_API_KEY", "").strip()), "status": st["terry_status"]},
-        "polymarket": {"status": st["gamma_status"], "live": st["clob_status"]},
+        "polymarket": {"status": st["gamma_status"], "live": st["clob_status"], "ws": st["pm_status"]},
         "position": position_view(),
         "scoreboard": scoreboard(mode),
         "thinking": st["now_thinking"],
@@ -985,14 +1374,17 @@ def build_state(since: Optional[int] = None) -> Dict[str, Any]:
         "history_full": full,
         "history": [p for p in st["history"] if p[0] >= lo],
         "odds_history": [p for p in st["odds_hist"] if p[0] >= lo],
-        "config": cfg,
+        "config": cfg, "config_version": cfg_meta["version"],
         "live": {"enabled": cfg["live_trading"], "ready": ok, "reason": why, "error": st["live_error"],
-                 "pnl_today": round(live_pnl_today(), 2), "slug": live_slug()},
+                 "pnl_today": round(live_pnl_today(), 2), "slug": live_slug(),
+                 "loss_budget_left": round(loss_budget_left(), 2)},
+        "balance": balance_view(),
+        "risk": {"trades_this_window": n_win, "max_trades_per_window": cfg["max_trades_per_window"],
+                 "cooldown_left": round(max(0.0, cfg["reentry_cooldown_sec"] - (now - st["last_exit_ts"])), 1)},
         "logs": st["logs"][:30],
     }
 
 
-# ---------------------------------------------------------------- ENDPOINTS --
 @app.get("/")
 async def index():
     return FileResponse(BASE_DIR / "index.html")
@@ -1000,7 +1392,8 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "name": BOT_NAME, "feed": st["feed_source"], "mode": "live" if cfg["live_trading"] else "paper"}
+    return {"ok": True, "name": BOT_NAME, "feed": st["feed_source"], "pm_ws": st["pm_status"],
+            "mode": "live" if cfg["live_trading"] else "paper"}
 
 
 @app.get("/state")
@@ -1025,20 +1418,25 @@ async def update_config(update: ConfigUpdate, x_admin_token: str = Header(defaul
                         raise ValueError(f"Live mode isn't ready: {why}.")
                     if live_pnl_today() <= -cfg["max_daily_loss"]:
                         raise ValueError("Today's live loss limit is already hit. Try again tomorrow or raise it.")
-                    cfg["live_trading"] = True
+                    set_cfg(key, True)
                     st["live_error"] = ""
+                    st["acct_evt"].set()
                     add_log("*** LIVE TRADING ENABLED: REAL MONEY ***")
+                    log_event("live_on", stake=cfg["stake_usd"], cap=cfg["max_live_stake"], limit=cfg["max_daily_loss"])
                     think("golive", "🔴 Live mode is ON. From here I'm placing real orders.", "go")
                 else:
-                    cfg["live_trading"] = False
+                    set_cfg(key, False)
                     add_log("Live trading switched OFF (paper mode).")
+                    log_event("live_off")
                     think("gopaper", "Back to paper mode. No real orders from me.", "info")
             else:
-                cfg[key] = clean_value(key, value)
+                set_cfg(key, value)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     save_state()
-    return {"status": "success", "config": cfg, "live_trading": cfg["live_trading"]}
+    log_event("config", changed=data)
+    return {"status": "success", "config": cfg, "config_version": cfg_meta["version"],
+            "live_trading": cfg["live_trading"]}
 
 
 @app.post("/cashout")
@@ -1048,10 +1446,9 @@ async def cashout(x_admin_token: str = Header(default="")):
     if not pos:
         raise HTTPException(status_code=400, detail="No active position to cash out.")
     q = st["last_quote"] or {}
-    price = q.get(pos["side"].lower())
-    if price is None:
+    if q.get(pos["side"].lower()) is None:
         raise HTTPException(status_code=400, detail="No live price available right now.")
-    trade = await close_position(price, "cash out (manual)", raise_on_fail=True)
+    trade = await close_position(fill_px(q, pos["side"], "sell"), "cash out (manual)", raise_on_fail=True)
     if trade is None:
         raise HTTPException(status_code=400, detail="Position was already closed.")
     return {"status": "success", "pnl": round(trade["pnl"], 2), "exit": trade["exit"]}
@@ -1076,6 +1473,56 @@ async def manual_trade(req: ManualTrade, x_admin_token: str = Header(default="")
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(e))
     return {"status": "success", "position": pos}
+
+
+@app.post("/kill")
+async def kill(x_admin_token: str = Header(default="")):
+    """Emergency stop: pause entries, live OFF, and try to flatten any open position."""
+    require_auth(x_admin_token)
+    set_cfg("paused", True)
+    set_cfg("live_trading", False)
+    log_event("kill")
+    add_log("KILL SWITCH: paused, live OFF.")
+    pos, q = st["position"], st["last_quote"] or {}
+    if pos and q.get(pos["side"].lower()) is not None:
+        await close_position(fill_px(q, pos["side"], "sell"), "kill switch")
+    save_state()
+    return {"status": "success", "position_open": st["position"] is not None}
+
+
+@app.get("/account")
+async def account(x_admin_token: str = Header(default="")):
+    require_auth(x_admin_token)
+    st["acct_evt"].set()
+    return balance_view()
+
+
+@app.post("/account/link")
+async def account_link(req: LinkAccount, x_admin_token: str = Header(default="")):
+    """Link keys at runtime. They are kept in memory only (lost on restart). For a permanent link,
+    set POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY as Railway variables."""
+    require_auth(x_admin_token)
+    if not POLY_SDK:
+        raise HTTPException(status_code=400, detail="polymarket-us SDK is not installed on this server.")
+    old_creds, old_client = st["creds"], st["client"]
+    st["creds"], st["client"] = (req.key_id.strip(), req.secret_key.strip()), None
+    try:
+        data = await asyncio.to_thread(fetch_account)
+    except Exception as e:  # noqa: BLE001
+        st["creds"], st["client"] = old_creds, old_client
+        raise HTTPException(status_code=400, detail=f"Could not verify those keys: {str(e)[:160]}")
+    st["account"] = {**data, "ts": time.time(), "status": "ok", "error": ""}
+    log_event("account_linked")
+    return balance_view()
+
+
+@app.post("/account/unlink")
+async def account_unlink(x_admin_token: str = Header(default="")):
+    require_auth(x_admin_token)
+    st["creds"], st["client"], st["account"] = None, None, {"status": "not linked"}
+    if not creds():
+        set_cfg("live_trading", False)
+    return balance_view()
 
 
 if __name__ == "__main__":
