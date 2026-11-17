@@ -1,23 +1,18 @@
 """
-Winston v5 -- 5-Minute BTC Up/Down desk. 24/7 cloud engine (FastAPI + asyncio).
+Winston v6 -- 5-Minute BTC Up/Down desk. 24/7 cloud engine (FastAPI + asyncio).
 
-WHAT CHANGED vs v4 (maps to the 7 pillars in the brief)
-  1. Latency/desync : Coinbase WS and Polymarket CLOB WS are the PRIMARY feeds (REST is fallback only).
-                      Window maths uses one epoch clock to the millisecond; the window open is the last
-                      tick at/before the boundary; /state carries server_time_ms + feed latency.
-  2. Multi-trade    : no more one-and-done. Up to `max_trades_per_window` entries per window, with a
-                      cooldown, and re-entries must have BTC back on the right side of the target.
-  3. Smart exits    : structural exit when the BTC-vs-target gap flips against us (buffer + hold time),
-                      emergency price stop only after `min_hold_sec`, trailing profit lock instead of a
-                      fixed clip, and "ride to settlement" once the contract is >= `hold_to_settle_price`.
-  4. Instant entry  : the engine is event-driven; every Coinbase / Polymarket tick wakes it immediately.
-                      The live SDK client and market slugs are pre-warmed.
-  5. State contract : /state keeps every v4 key and shape (additive fields only). `config_version`
-                      lets the UI ignore stale polls so sliders never snap back.
-  6. Live controls  : stake, hard cap, % of balance cap, remaining-loss-budget sizing, daily loss
-                      circuit breaker, /kill switch. Live always boots OFF.
-  7. Account        : balance/portfolio fetched from the SDK (best-effort field mapping, see
-                      fetch_account), exposed as state["balance"]. /account, /account/link, /account/unlink.
+WHAT CHANGED vs v5 (made to match the new Vice City index.html)
+  * New entry filters the dashboard presets/sliders already send:
+      confirm_sec      signal + every filter must hold this long before a buy
+      min_edge         our confidence minus the price we pay must be at least this (buy when odds lag)
+      align_min_odds   the market's own price on our side must be at least this (crowd roughly agrees)
+      max_spread       skip when the buy/sell gap on our contract is wider than this
+  * Losing-streak breaker: loss_streak_pause losses in a row -> sit out streak_pause_windows full rounds.
+  * /state.risk now reports loss_streak + pause_left (the page's status strip and checklist use them).
+  * Prices in Winston's chat are written in cents to match the page.
+  * Default settings are now the "Scalper" preset. Saved exit/entry settings are reset once (SCHEMA 3).
+  * Everything else (feeds, exits, live safety, /kill, account) is unchanged from v5.
+  * Live trading still ALWAYS boots OFF. Nothing here is a profit guarantee.
 
 Environment variables
   ADMIN_TOKEN (required for live) | TERRY_API_KEY | POLYMARKET_KEY_ID | POLYMARKET_SECRET_KEY
@@ -85,16 +80,18 @@ ADMIN_TOKEN_ENV = os.environ.get("ADMIN_TOKEN", "").strip()
 ADMIN_TOKEN = ADMIN_TOKEN_ENV or secrets.token_urlsafe(18)
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    # entry
-    "min_confidence": 55.0, "min_btc_move": 0.02, "entry_min_sec": 5, "entry_max_sec": 200,
-    "max_entry_price": 0.85, "min_entry_price": 0.15,
+    # entry (defaults = the dashboard's "Scalper" preset)
+    "min_confidence": 55.0, "min_btc_move": 0.006, "entry_min_sec": 5, "entry_max_sec": 75,
+    "max_entry_price": 0.72, "min_entry_price": 0.40,
+    "confirm_sec": 1.5, "min_edge": 0.01, "align_min_odds": 0.50, "max_spread": 0.04,
     # multi-trade
-    "max_trades_per_window": 2, "reentry_cooldown_sec": 6, "after_loss_cooldown_sec": 30, "max_window_losses": 2,
+    "max_trades_per_window": 2, "reentry_cooldown_sec": 6, "after_loss_cooldown_sec": 30, "max_window_losses": 1,
     "knife_pts": 0.05, "knife_window_sec": 6,
+    "loss_streak_pause": 3, "streak_pause_windows": 2,
     # exits
-    "take_profit": 0.10, "stop_loss": 0.20, "force_exit_sec": 270,
+    "take_profit": 0.06, "stop_loss": 0.12, "force_exit_sec": 120,
     "inval_buffer_pct": 0.015, "inval_hold_sec": 4.0, "min_hold_sec": 3.0,
-    "trail_pct": 0.07, "hold_to_settle_price": 0.95,
+    "trail_pct": 0.04, "hold_to_settle_price": 0.95,
     # sizing / live safety
     "stake_usd": 10.0, "fee_pct": 2.0, "max_daily_loss": 30.0, "max_live_stake": 25.0,
     "max_stake_pct_balance": 25.0,
@@ -113,15 +110,19 @@ RANGES = {  # kept wide so the dashboard sliders are never silently clamped
     "max_stake_pct_balance": (0.0, 100.0),
     "after_loss_cooldown_sec": (0.0, 600.0), "max_window_losses": (1, 20), "knife_pts": (0.0, 0.5),
     "knife_window_sec": (1.0, 60.0),
+    "confirm_sec": (0.0, 10.0), "min_edge": (0.0, 0.5), "align_min_odds": (0.0, 0.95), "max_spread": (0.0, 0.5),
+    "loss_streak_pause": (1, 10), "streak_pause_windows": (0, 12),
 }
-INT_KEYS = {"entry_min_sec", "entry_max_sec", "force_exit_sec", "max_trades_per_window", "max_window_losses"}
+INT_KEYS = {"entry_min_sec", "entry_max_sec", "force_exit_sec", "max_trades_per_window", "max_window_losses",
+            "loss_streak_pause", "streak_pause_windows"}
 BOOL_KEYS = ("live_trading", "paused", "winston_veto")
 
 cfg: Dict[str, Any] = dict(DEFAULT_CONFIG)
 cfg_meta = {"version": 0, "updated": time.time()}
-SCHEMA = 2  # bump when defaults change meaning; older saved exit/risk settings are then reset
+SCHEMA = 3  # bump when defaults change meaning; older saved exit/risk settings are then reset
 RESET_KEYS = {"stop_loss", "take_profit", "min_hold_sec", "trail_pct", "max_trades_per_window", "reentry_cooldown_sec",
-              "min_confidence", "min_entry_price", "max_entry_price", "inval_buffer_pct", "inval_hold_sec"}
+              "min_confidence", "min_entry_price", "max_entry_price", "inval_buffer_pct", "inval_hold_sec",
+              "min_btc_move", "entry_min_sec", "entry_max_sec", "force_exit_sec", "max_window_losses"}
 
 st: Dict[str, Any] = {
     "btc": None, "btc_ts": 0.0, "feed_source": "starting", "latency_ms": None,
@@ -129,6 +130,7 @@ st: Dict[str, Any] = {
     "window_start": None, "window_open": None, "open_source": "", "partial": False,
     "win_trades": {}, "win_losses": {}, "side_block": {}, "last_exit_loss": False, "basis": 0.0,
     "mid_hist": deque(maxlen=400), "last_exit_ts": 0.0, "entry_block_until": 0.0,
+    "loss_streak": 0, "pause_until": 0.0, "confirm": None,
     "terry": None, "terry_status": "starting", "terry_key": None,
     "gamma": {}, "gamma_status": "starting", "clob": None, "clob_status": "starting",
     "books": {}, "pm_last_msg": 0.0, "pm_sub": set(), "pm_status": "starting",
@@ -175,7 +177,7 @@ def think(kind: str, text: str, tone: str = "wait") -> None:
 
 
 def pc(p: float) -> str:
-    return f"{p * 100:.0f}%"
+    return f"{p * 100:.0f}¢"
 
 
 def window_of(t: float) -> int:
@@ -758,6 +760,7 @@ async def open_position(side: str, quote: Dict[str, Any], *, manual: bool, confi
         now = time.time()
         ws = st["window_start"]
         st["win_trades"][ws] = st["win_trades"].get(ws, 0) + 1
+        st["confirm"] = None  # a fresh confirmation is needed for any re-entry
         pos = {
             "id": f"t{int(now * 1000)}", "mode": mode, "side": side, "slug": slug, "window_start": ws,
             "opened_at": now, "entry": round(price, 4), "shares": shares, "stake": round(shares * price, 2),
@@ -776,6 +779,21 @@ async def open_position(side: str, quote: Dict[str, Any], *, manual: bool, confi
         think(f"entered{pos['id']}", f"🟢 {why or 'You asked for this one.'} Buying {side} with "
                                      f"${pos['stake']:.2f} [{mode.upper()}].", "go")
         return pos
+
+
+def note_streak(pos: Dict[str, Any], pnl: float) -> None:
+    """Losing-streak breaker: N losing trades in a row -> sit out the next M full rounds."""
+    if pos.get("manual"):
+        return
+    if pnl > 0:
+        st["loss_streak"] = 0
+        return
+    st["loss_streak"] += 1
+    n, w = int(cfg["loss_streak_pause"]), int(cfg["streak_pause_windows"])
+    if w > 0 and st["loss_streak"] >= n:
+        st["pause_until"] = pos["window_start"] + (1 + w) * WINDOW
+        add_log(f"{st['loss_streak']} losses in a row: standing down for {w} round(s).")
+        log_event("streak_pause", losses=st["loss_streak"], rounds=w)
 
 
 async def close_position(price: float, reason: str, settle: bool = False,
@@ -812,6 +830,7 @@ async def close_position(price: float, reason: str, settle: bool = False,
             w = pos["window_start"]
             st["win_losses"][w] = st["win_losses"].get(w, 0) + 1
             st["side_block"].setdefault(w, set()).add(pos["side"])
+        note_streak(pos, pnl)
         save_state()
         add_log(f"[{pos['mode'].upper()}] SELL {pos['side']} @ {price:.2f} ({reason}) pnl ${pnl:+.2f}")
         log_event("exit", id=pos["id"], mode=pos["mode"], side=pos["side"], exit=trade["exit"], reason=reason,
@@ -897,6 +916,7 @@ async def consider_entry(q: Dict[str, Any], elapsed: float, move: float) -> None
     ws, sig, now = st["window_start"], st["signal"], time.time()
     side, conf = sig["side"], sig["confidence"]
     terry = cfg["signal_source"] == "terrycalls"
+    prev_conf, st["confirm"] = st["confirm"], None  # any early return below restarts the confirmation timer
     view = (f"{'Terry says' if terry else 'My read says'} {side} at {conf:.0f}%"
             if side and conf is not None else sig["detail"])
     n = st["win_trades"].get(ws, 0)
@@ -904,6 +924,12 @@ async def consider_entry(q: Dict[str, Any], elapsed: float, move: float) -> None
         return think("paused", "I'm paused, so I'm only watching. Hit Resume when you want me trading.")
     if st["partial"]:
         return think("partial", "I joined this window late, so I don't trust the target price. Sitting this one out.")
+    if st["pause_until"] and now >= st["pause_until"]:
+        st["pause_until"], st["loss_streak"] = 0.0, 0
+        add_log("Losing-streak pause is over. Trading again.")
+    if now < st["pause_until"]:
+        return think(f"streak{int(st['pause_until'])}", f"{int(cfg['loss_streak_pause'])} losses in a row, so I'm "
+                                                       f"standing down for a few rounds to stop a bad patch compounding.")
     if n >= cfg["max_trades_per_window"]:
         return think(f"cap{ws}", f"That's my {n} trade(s) for this window. On to the next one.")
     if st["win_losses"].get(ws, 0) >= cfg["max_window_losses"]:
@@ -937,13 +963,32 @@ async def consider_entry(q: Dict[str, Any], elapsed: float, move: float) -> None
     if price < cfg["min_entry_price"]:
         return think(f"cheap:{side}", f"{view}. But the crowd only gives {side} {pc(price)}, so they strongly "
                                       f"disagree. Passing.")
+    mid = q[side.lower()]
+    if mid < cfg["align_min_odds"]:
+        return think(f"align:{side}", f"{view}. But the market only prices {side} at {pc(mid)}, under my "
+                                      f"{pc(cfg['align_min_odds'])} agreement floor. Passing.")
+    bid_, ask_ = q.get(f"{side.lower()}_bid"), q.get(f"{side.lower()}_ask")
+    if bid_ is not None and ask_ is not None and ask_ - bid_ > cfg["max_spread"]:
+        return think(f"spread:{side}", f"{view}. But the buy/sell gap on {side} is {(ask_ - bid_) * 100:.0f}¢, wider "
+                                       f"than my {cfg['max_spread'] * 100:.0f}¢ limit, so the fill would cost too much.")
+    edge_px = conf / 100.0 - price
+    if edge_px < cfg["min_edge"]:
+        return think(f"noedge:{side}", f"{view}. But {side} costs {pc(price)}, so I only see {edge_px * 100:.1f}¢ of "
+                                       f"edge and I need {cfg['min_edge'] * 100:.1f}¢. The odds haven't lagged enough.")
     drop = odds_drop(side, cfg["knife_window_sec"])
     if drop >= cfg["knife_pts"]:
         return think(f"knife:{side}", f"{view}, but {side} just fell {drop * 100:.0f} points in {cfg['knife_window_sec']:.0f}s. "
                                       f"The market is moving against it, so I won't catch a falling knife.")
     if cfg["live_trading"] and q["source"] == "estimated":
         return think("estlive", "No real market price right now, so I won't place a live order.")
-    why = (f"{view}, BTC {move:+.3f}% vs the target, {side} costs {pc(price)}"
+    if cfg["confirm_sec"] > 0:
+        same = bool(prev_conf and prev_conf["ws"] == ws and prev_conf["side"] == side)
+        since = prev_conf["since"] if same else now
+        st["confirm"] = {"ws": ws, "side": side, "since": since}
+        if now - since < cfg["confirm_sec"]:
+            return think(f"confirm{ws}:{side}", f"{view}. Every check passes, so I'm confirming it for "
+                                                f"{cfg['confirm_sec']:.1f}s before I buy.")
+    why = (f"{view}, BTC {move:+.3f}% vs the target, {side} costs {pc(price)}, edge {edge_px * 100:.1f}¢"
            + (f" (re-entry #{n + 1})" if n else "") + ".")
     try:
         await open_position(side, q, manual=False, confidence=conf, move_pct=move, why=why)
@@ -1284,7 +1329,7 @@ async def lifespan(_app: FastAPI):
 
 
 # ================================================================== API ==
-app = FastAPI(title=f"{BOT_NAME} · 5-Minute BTC Up/Down Desk", version="5.0", lifespan=lifespan)
+app = FastAPI(title=f"{BOT_NAME} · 5-Minute BTC Up/Down Desk", version="6.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -1295,6 +1340,7 @@ def require_auth(token: str) -> None:
 
 
 class ConfigUpdate(BaseModel):
+    # Unknown keys (the page may send extras like scalp_mode) are ignored by pydantic, not rejected.
     stake_usd: Optional[float] = None
     max_entry_price: Optional[float] = None
     min_entry_price: Optional[float] = None
@@ -1320,6 +1366,12 @@ class ConfigUpdate(BaseModel):
     max_window_losses: Optional[float] = None
     knife_pts: Optional[float] = None
     knife_window_sec: Optional[float] = None
+    confirm_sec: Optional[float] = None
+    min_edge: Optional[float] = None
+    align_min_odds: Optional[float] = None
+    max_spread: Optional[float] = None
+    loss_streak_pause: Optional[float] = None
+    streak_pause_windows: Optional[float] = None
     signal_source: Optional[str] = None
     winston_veto: Optional[bool] = None
     live_trading: Optional[bool] = None
@@ -1431,7 +1483,8 @@ def build_state(since: Optional[int] = None) -> Dict[str, Any]:
                  "loss_budget_left": round(loss_budget_left(), 2)},
         "balance": balance_view(),
         "risk": {"trades_this_window": n_win, "max_trades_per_window": cfg["max_trades_per_window"],
-                 "cooldown_left": round(max(0.0, cfg["reentry_cooldown_sec"] - (now - st["last_exit_ts"])), 1)},
+                 "cooldown_left": round(max(0.0, cfg["reentry_cooldown_sec"] - (now - st["last_exit_ts"])), 1),
+                 "loss_streak": st["loss_streak"], "pause_left": round(max(0.0, st["pause_until"] - now), 1)},
         "logs": st["logs"][:30],
     }
 
