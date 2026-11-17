@@ -89,7 +89,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "min_confidence": 55.0, "min_btc_move": 0.02, "entry_min_sec": 5, "entry_max_sec": 200,
     "max_entry_price": 0.85, "min_entry_price": 0.15,
     # multi-trade
-    "max_trades_per_window": 3, "reentry_cooldown_sec": 6,
+    "max_trades_per_window": 2, "reentry_cooldown_sec": 6, "after_loss_cooldown_sec": 30, "max_window_losses": 2,
+    "knife_pts": 0.05, "knife_window_sec": 6,
     # exits
     "take_profit": 0.10, "stop_loss": 0.20, "force_exit_sec": 270,
     "inval_buffer_pct": 0.015, "inval_hold_sec": 4.0, "min_hold_sec": 3.0,
@@ -110,18 +111,24 @@ RANGES = {  # kept wide so the dashboard sliders are never silently clamped
     "reentry_cooldown_sec": (0.0, 120.0), "inval_buffer_pct": (0.0, 1.0), "inval_hold_sec": (0.0, 60.0),
     "min_hold_sec": (0.0, 60.0), "trail_pct": (0.005, 1.0), "hold_to_settle_price": (0.5, 1.0),
     "max_stake_pct_balance": (0.0, 100.0),
+    "after_loss_cooldown_sec": (0.0, 600.0), "max_window_losses": (1, 20), "knife_pts": (0.0, 0.5),
+    "knife_window_sec": (1.0, 60.0),
 }
-INT_KEYS = {"entry_min_sec", "entry_max_sec", "force_exit_sec", "max_trades_per_window"}
+INT_KEYS = {"entry_min_sec", "entry_max_sec", "force_exit_sec", "max_trades_per_window", "max_window_losses"}
 BOOL_KEYS = ("live_trading", "paused", "winston_veto")
 
 cfg: Dict[str, Any] = dict(DEFAULT_CONFIG)
 cfg_meta = {"version": 0, "updated": time.time()}
+SCHEMA = 2  # bump when defaults change meaning; older saved exit/risk settings are then reset
+RESET_KEYS = {"stop_loss", "take_profit", "min_hold_sec", "trail_pct", "max_trades_per_window", "reentry_cooldown_sec",
+              "min_confidence", "min_entry_price", "max_entry_price", "inval_buffer_pct", "inval_hold_sec"}
 
 st: Dict[str, Any] = {
     "btc": None, "btc_ts": 0.0, "feed_source": "starting", "latency_ms": None,
     "ticks": deque(maxlen=600), "history": [], "odds_hist": [],
     "window_start": None, "window_open": None, "open_source": "", "partial": False,
-    "win_trades": {}, "last_exit_ts": 0.0, "entry_block_until": 0.0,
+    "win_trades": {}, "win_losses": {}, "side_block": {}, "last_exit_loss": False, "basis": 0.0,
+    "mid_hist": deque(maxlen=400), "last_exit_ts": 0.0, "entry_block_until": 0.0,
     "terry": None, "terry_status": "starting", "terry_key": None,
     "gamma": {}, "gamma_status": "starting", "clob": None, "clob_status": "starting",
     "books": {}, "pm_last_msg": 0.0, "pm_sub": set(), "pm_status": "starting",
@@ -224,6 +231,31 @@ def trade_date(t: Dict[str, Any]):
     return datetime.fromtimestamp(t["closed_at"], TZ).date()
 
 
+def hist_price_at(ts: int) -> Optional[float]:
+    """Raw Coinbase price at a window boundary, from the per-second history."""
+    for t, p in st["history"]:
+        if ts - 2 <= t <= ts + 1:
+            return p
+    return None
+
+
+def btc_adj() -> Optional[float]:
+    """Coinbase price shifted by this window's basis so it lines up with the market's target source."""
+    return None if st["btc"] is None else st["btc"] + st["basis"]
+
+
+def odds_drop(side: str, secs: float) -> float:
+    """How many points this side's price fell over the last `secs` seconds (falling-knife detector)."""
+    now, k, cur, past = time.time(), (1 if side == "UP" else 2), None, None
+    for rec in reversed(st["mid_hist"]):
+        if cur is None:
+            cur = rec[k]
+        if now - rec[0] >= secs:
+            past = rec[k]
+            break
+    return (past - cur) if past is not None and cur is not None else 0.0
+
+
 def fill_px(q: Dict[str, Any], side: str, kind: str) -> float:
     """Realistic fill price: buys pay the ask, sells hit the bid; falls back to the midpoint."""
     k = side.lower()
@@ -296,7 +328,7 @@ def set_cfg(key: str, value: Any) -> None:
 def save_state() -> None:
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {"trades": st["trades"][-2000:], "config": {**cfg, "live_trading": False}}
+        payload = {"schema": SCHEMA, "trades": st["trades"][-2000:], "config": {**cfg, "live_trading": False}}
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload))
         tmp.replace(STATE_FILE)
@@ -309,8 +341,11 @@ def load_state() -> None:
         if STATE_FILE.exists():
             data = json.loads(STATE_FILE.read_text())
             st["trades"] = list(data.get("trades", []))[-2000:]
+            stale = data.get("schema") != SCHEMA
+            if stale:
+                add_log("Old saved settings found: exit/entry limits reset to the new defaults.")
             for k, v in (data.get("config") or {}).items():
-                if k in cfg and k != "live_trading":
+                if k in cfg and k != "live_trading" and not (stale and k in RESET_KEYS):
                     try:
                         cfg[k] = clean_value(k, v)
                     except Exception:  # noqa: BLE001
@@ -506,10 +541,11 @@ def terry_announce() -> None:
 
 
 def adopt_price_to_beat() -> None:
-    """Terry's price-to-beat matches the settlement source better than a Coinbase tick, so adopt it
-    (once per window) if it's sane, even when we joined late."""
-    t, ws, cur = st["terry"], st["window_start"], st["window_open"]
-    if not t or ws is None or not cur or st["open_source"].startswith("terrycalls"):
+    """Terry's price-to-beat is the market's real target. Coinbase and the market's price source differ by
+    a few dollars (the "basis"), so we measure that offset at the window boundary and shift our price by it.
+    That keeps the chart starting ON the target and the gap maths honest."""
+    t, ws = st["terry"], st["window_start"]
+    if not t or ws is None or st["open_source"].startswith("terrycalls"):
         return
     if not terry_matches(t, WINDOW - (time.time() - ws)):
         return
@@ -517,9 +553,12 @@ def adopt_price_to_beat() -> None:
         ptb = float(t["item"].get("price_to_beat"))
     except (TypeError, ValueError):
         return
-    if ptb > 0 and abs(ptb - cur) / cur * 100 <= 0.15:
-        st["window_open"], st["open_source"], st["partial"] = ptb, "terrycalls price-to-beat", False
-        add_log(f"Target adopted from Terry price-to-beat: {ptb:,.2f}")
+    cb0 = hist_price_at(ws)
+    if ptb <= 0 or cb0 is None or abs(ptb - cb0) / cb0 * 100 > 0.15:
+        return
+    st["window_open"], st["basis"] = ptb, ptb - cb0
+    st["open_source"], st["partial"] = "terrycalls price-to-beat", False
+    add_log(f"Target {ptb:,.2f} from Terry; basis vs Coinbase {ptb - cb0:+.2f}")
 
 
 # ============================================================ LIVE (SDK) ==
@@ -722,7 +761,7 @@ async def open_position(side: str, quote: Dict[str, Any], *, manual: bool, confi
         pos = {
             "id": f"t{int(now * 1000)}", "mode": mode, "side": side, "slug": slug, "window_start": ws,
             "opened_at": now, "entry": round(price, 4), "shares": shares, "stake": round(shares * price, 2),
-            "price_source": quote["source"], "btc_open": st["window_open"], "btc_at_entry": st["btc"],
+            "price_source": quote["source"], "btc_open": st["window_open"], "btc_at_entry": btc_adj(),
             "move_pct_at_entry": round(move_pct, 4), "signal_source": "manual" if manual else cfg["signal_source"],
             "confidence": confidence, "manual": manual, "order_id": order.get("order_id"),
             "fee_pct": cfg["fee_pct"], "peak": round(price, 4), "inval_since": None,
@@ -762,12 +801,17 @@ async def close_position(price: float, reason: str, settle: bool = False,
         pnl = pos["shares"] * (price - pos["entry"]) - fee
         now = time.time()
         trade = {**pos, "exit": round(price, 4), "reason": reason, "pnl": round(pnl, 4), "fee": round(fee, 4),
-                 "closed_at": now, "held_sec": round(now - pos["opened_at"], 1), "btc_at_exit": st["btc"],
+                 "closed_at": now, "held_sec": round(now - pos["opened_at"], 1), "btc_at_exit": btc_adj(),
                  "close_order_id": info.get("order_id"), "settled": settle}
         st["trades"].append(trade)
         del st["trades"][:-2000]
         st["position"] = None
         st["last_exit_ts"] = now
+        st["last_exit_loss"] = pnl < 0 and not settle
+        if pnl < 0 and not settle:  # a loss: that side is off-limits for the rest of this window
+            w = pos["window_start"]
+            st["win_losses"][w] = st["win_losses"].get(w, 0) + 1
+            st["side_block"].setdefault(w, set()).add(pos["side"])
         save_state()
         add_log(f"[{pos['mode'].upper()}] SELL {pos['side']} @ {price:.2f} ({reason}) pnl ${pnl:+.2f}")
         log_event("exit", id=pos["id"], mode=pos["mode"], side=pos["side"], exit=trade["exit"], reason=reason,
@@ -799,24 +843,16 @@ async def on_new_window(ws: int, elapsed: float, btc: float) -> None:
         if q.get("source") not in (None, "estimated") and mid is not None and (mid >= 0.9 or mid <= 0.1):
             won = mid >= 0.9  # the market's own final price is the best read on the real settlement
         else:
-            final = price_at(ws) or btc
+            final = (price_at(ws) or btc) + st["basis"]
             won = (pos["side"] == "UP") == (final >= (st["window_open"] or final))
         await close_position(1.0 if won else 0.0, f"window expired ({'won' if won else 'lost'})", settle=True)
     st["window_start"] = ws
-    st["win_trades"] = {k: v for k, v in st["win_trades"].items() if k >= ws - 3 * WINDOW}
-    open_price, source, partial = (price_at(ws) or btc) if elapsed <= 3 else btc, "live feed", False
-    if elapsed > 3:
-        t = terry_fresh()
-        ptb = None
-        if t and terry_matches(t, WINDOW - elapsed):
-            try:
-                ptb = float(t["item"].get("price_to_beat"))
-            except (TypeError, ValueError):
-                ptb = None
-        if ptb and ptb > 0:
-            open_price, source = ptb, "terrycalls price-to-beat"
-        else:
-            partial = True
+    for d in (st["win_trades"], st["win_losses"], st["side_block"]):
+        for k in [k for k in d if k < ws - 3 * WINDOW]:
+            del d[k]
+    st["basis"] = 0.0
+    cb0 = price_at(ws) if elapsed <= 3 else hist_price_at(ws)
+    open_price, source, partial = (cb0 if cb0 is not None else btc), "live feed", (cb0 is None and elapsed > 3)
     st["window_open"], st["open_source"], st["partial"] = open_price, source, partial
     add_log(f"New window {ws}: target {open_price:,.2f} ({source})" + (" - joined late, sitting out" if partial else ""))
     say("sys", f"w{ws}", f"New 5-minute window · target ${open_price:,.2f}", "sys")
@@ -844,7 +880,7 @@ async def manage_position(q: Dict[str, Any], elapsed: float, move: float) -> Non
     elif same and held >= cfg["min_hold_sec"] and pos["entry"] - mid >= cfg["stop_loss"]:
         reason = "emergency stop"
     elif same and armed and not riding and (pos["peak"] - mid >= cfg["trail_pct"] or edge <= 0):
-        reason = "profit locked"
+        reason = "profit locked" if bid > pos["entry"] else "gave back profit"
     elif elapsed >= cfg["force_exit_sec"] and not riding:
         reason = "time exit"
     if reason:
@@ -870,8 +906,11 @@ async def consider_entry(q: Dict[str, Any], elapsed: float, move: float) -> None
         return think("partial", "I joined this window late, so I don't trust the target price. Sitting this one out.")
     if n >= cfg["max_trades_per_window"]:
         return think(f"cap{ws}", f"That's my {n} trade(s) for this window. On to the next one.")
-    if n and now - st["last_exit_ts"] < cfg["reentry_cooldown_sec"]:
-        return think(f"cool{ws}:{n}", "Short cooldown after my last exit, then I'll look for another entry.")
+    if st["win_losses"].get(ws, 0) >= cfg["max_window_losses"]:
+        return think(f"wl{ws}", f"{st['win_losses'][ws]} losses in this window, so I'm standing down until the next one.")
+    cd = cfg["after_loss_cooldown_sec"] if st["last_exit_loss"] else cfg["reentry_cooldown_sec"]
+    if n and now - st["last_exit_ts"] < cd:
+        return think(f"cool{ws}:{n}", "Cooling down after my last exit before I look for another entry.")
     if now < st["entry_block_until"]:
         return
     if elapsed < cfg["entry_min_sec"]:
@@ -882,6 +921,8 @@ async def consider_entry(q: Dict[str, Any], elapsed: float, move: float) -> None
         return think(f"sig:{sig['status']}:{sig.get('lean')}", f"{sig['detail']} I'll keep watching.")
     if conf is None or conf < cfg["min_confidence"]:
         return think(f"lowconf:{side}", f"{view}, but I need at least {cfg['min_confidence']:.0f}%. Passing for now.")
+    if side in st["side_block"].get(ws, ()):
+        return think(f"blk{ws}:{side}", f"I already lost on {side} in this window, so I won't buy it again until the next one.")
     edge = move if side == "UP" else -move
     if terry and cfg["winston_veto"] and edge <= -cfg["min_btc_move"]:
         return think(f"veto:{side}", f"{view}, but BTC is {move:+.3f}% vs the target, pointing the other way. "
@@ -896,6 +937,10 @@ async def consider_entry(q: Dict[str, Any], elapsed: float, move: float) -> None
     if price < cfg["min_entry_price"]:
         return think(f"cheap:{side}", f"{view}. But the crowd only gives {side} {pc(price)}, so they strongly "
                                       f"disagree. Passing.")
+    drop = odds_drop(side, cfg["knife_window_sec"])
+    if drop >= cfg["knife_pts"]:
+        return think(f"knife:{side}", f"{view}, but {side} just fell {drop * 100:.0f} points in {cfg['knife_window_sec']:.0f}s. "
+                                      f"The market is moving against it, so I won't catch a falling knife.")
     if cfg["live_trading"] and q["source"] == "estimated":
         return think("estlive", "No real market price right now, so I won't place a live order.")
     why = (f"{view}, BTC {move:+.3f}% vs the target, {side} costs {pc(price)}"
@@ -926,9 +971,11 @@ async def tick() -> None:
     if st["window_start"] != ws:
         await on_new_window(ws, elapsed, btc)
     open_price = st["window_open"]
-    move = (btc - open_price) / open_price * 100.0
+    move = (btc + st["basis"] - open_price) / open_price * 100.0
     q = get_quote(WINDOW - elapsed, move)
     st["last_quote"], st["last_move"] = q, move
+    if q["source"] != "estimated":
+        st["mid_hist"].append((now, q["up"], q["down"]))
     if new_second:
         total = q["up"] + q["down"]
         st["odds_hist"].append([ts, round(q["up"] / total * 100.0, 1)])
@@ -1269,6 +1316,10 @@ class ConfigUpdate(BaseModel):
     min_hold_sec: Optional[float] = None
     trail_pct: Optional[float] = None
     hold_to_settle_price: Optional[float] = None
+    after_loss_cooldown_sec: Optional[float] = None
+    max_window_losses: Optional[float] = None
+    knife_pts: Optional[float] = None
+    knife_window_sec: Optional[float] = None
     signal_source: Optional[str] = None
     winston_veto: Optional[bool] = None
     live_trading: Optional[bool] = None
@@ -1337,7 +1388,7 @@ def build_state(since: Optional[int] = None) -> Dict[str, Any]:
     now = time.time()
     ws = st["window_start"] or window_of(now)
     left = max(0.0, WINDOW - (now - ws))
-    btc, open_price = st["btc"], st["window_open"]
+    open_price, btc = st["window_open"], btc_adj()
     q = st["last_quote"] or {}
     ok, why = live_ready()
     mode = "live" if cfg["live_trading"] else "paper"
@@ -1349,7 +1400,7 @@ def build_state(since: Optional[int] = None) -> Dict[str, Any]:
     n_win = st["win_trades"].get(ws, 0)
     return {
         "name": BOT_NAME, "server_time": now, "server_time_ms": int(now * 1000), "mode": mode,
-        "btc_price": btc, "window_start": ws, "window_end": ws + WINDOW,
+        "btc_price": btc, "btc_raw": st["btc"], "basis": round(st["basis"], 2), "window_start": ws, "window_end": ws + WINDOW,
         "window_start_ms": ws * 1000, "window_end_ms": (ws + WINDOW) * 1000, "seconds_left": round(left, 3),
         "window_open": open_price, "open_source": st["open_source"], "partial": st["partial"],
         "delta_pct": round(st["last_move"], 4),
@@ -1372,7 +1423,7 @@ def build_state(since: Optional[int] = None) -> Dict[str, Any]:
         "recent_trades": list(reversed(st["trades"][-50:])),
         "markers": markers_view(floor),
         "history_full": full,
-        "history": [p for p in st["history"] if p[0] >= lo],
+        "history": [[p[0], p[1] + st["basis"]] for p in st["history"] if p[0] >= lo],
         "odds_history": [p for p in st["odds_hist"] if p[0] >= lo],
         "config": cfg, "config_version": cfg_meta["version"],
         "live": {"enabled": cfg["live_trading"], "ready": ok, "reason": why, "error": st["live_error"],
